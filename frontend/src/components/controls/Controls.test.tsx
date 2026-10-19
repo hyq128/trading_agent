@@ -1,0 +1,385 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { Controls } from "./Controls";
+import type {
+  ConfigResponseDTO,
+  RunCreateRequestDTO,
+  RunSnapshotDTO,
+} from "../../api/contracts";
+
+// --- Mocks (hoisted so vi.mock factories can reference them) -------------
+
+const mockStore = vi.hoisted(() => ({
+  run_id: null as string | null,
+  selectRun: vi.fn(),
+  stream: {
+    state: null,
+    status: "idle" as string,
+    error: null,
+    close: vi.fn(),
+  },
+}));
+
+vi.mock("../../state/WorkbenchStore", () => ({
+  useWorkbenchStore: () => mockStore,
+  // 细粒度订阅从同一聚合 mock 派生；既有用例无需改动。
+  useWorkbenchStream: () => mockStore.stream,
+  useWorkbenchSelection: () => mockStore,
+}));
+
+const mockClient = vi.hoisted(() => ({
+  getConfig: vi.fn(),
+  createRun: vi.fn(),
+  cancelRun: vi.fn(),
+}));
+
+vi.mock("../../api/client", () => ({
+  getConfig: mockClient.getConfig,
+  createRun: mockClient.createRun,
+  cancelRun: mockClient.cancelRun,
+  // Minimal ApiError shape matching the real class (code/message). The
+  // component uses `instanceof ApiError` to detect the VPN preflight block.
+  ApiError: class ApiError extends Error {
+    code: string;
+    status: number;
+    fields: string[];
+    constructor(params: { code: string; message: string; status: number }) {
+      super(params.message);
+      this.name = "ApiError";
+      this.code = params.code;
+      this.status = params.status;
+      this.fields = [];
+    }
+  },
+}));
+
+// --- Fixtures ------------------------------------------------------------
+
+function makeConfig(): ConfigResponseDTO {
+  return {
+    research_profiles: { classic: { supported: false, reason: "历史" }, catalyst_v1: { supported: false, reason: "历史" }, evidence_v1: { supported: true, reason: null } },
+    providers: [
+      {
+        id: "deepseek",
+        configured: true,
+        requires_api_key: true,
+        models: {
+          quick: [
+            { label: "DeepSeek Chat", id: "deepseek-chat" },
+            { label: "DeepSeek Reasoner", id: "deepseek-reasoner" },
+          ],
+          deep: [{ label: "DeepSeek Reasoner", id: "deepseek-reasoner" }],
+        },
+        custom_model_allowed: false,
+      },
+      {
+        id: "openai",
+        configured: false,
+        requires_api_key: true,
+        models: {
+          quick: [{ label: "GPT-4o", id: "gpt-4o" }],
+          deep: [{ label: "GPT-4o", id: "gpt-4o" }],
+        },
+        custom_model_allowed: false,
+      },
+    ],
+    configured_keys: { deepseek: true, openai: false },
+    analysts: [
+      { id: "market" },
+      { id: "social" },
+      { id: "news" },
+      { id: "fundamentals" },
+    ],
+    presets: [
+      {
+        id: "full-research",
+        label: "全维度研究",
+        analysts: ["market", "social", "news", "fundamentals"],
+      },
+      {
+        id: "news-first",
+        label: "新闻优先",
+        analysts: ["news", "market"],
+      },
+    ],
+    depths: [1, 3, 5],
+    output_languages: ["English", "Chinese"],
+    checkpoint_available: true,
+    wind: {
+      enabled: true,
+      configured: true,
+      capabilities: ["指数快照与历史", "指数估值", "个股风险指标", "宏观 EDB"],
+    },
+    defaults: {
+      llm_provider: "deepseek",
+      quick_think_llm: "deepseek-chat",
+      deep_think_llm: "deepseek-reasoner",
+      output_language: "Chinese",
+      research_depth: 3,
+      checkpoint_enabled: false,
+    },
+  };
+}
+
+function makeSnapshot(): RunSnapshotDTO {
+  return {
+    run_id: "run_x",
+    status: "created",
+    ticker: "600803",
+    asset_type: "stock",
+    analysis_date: "2026-07-19",
+    selected_analysts: ["market", "social", "news", "fundamentals"],
+    max_debate_rounds: 3,
+    max_risk_discuss_rounds: 3,
+    output_language: "Chinese",
+    llm_provider: "deepseek",
+    quick_think_llm: "deepseek-chat",
+    deep_think_llm: "deepseek-reasoner",
+    configured_keys: { deepseek: true },
+    created_at: "2026-07-19T00:00:00Z",
+    updated_at: "2026-07-19T00:00:00Z",
+    latest_sequence: 0,
+    artifacts: [],
+    redaction_manifest: [],
+    event_schema_version: 1,
+    metadata: {},
+  };
+}
+
+// --- Helpers -------------------------------------------------------------
+
+async function waitForConfig(): Promise<void> {
+  await waitFor(() => {
+    expect(
+      (screen.getByLabelText("LLM Provider") as HTMLSelectElement).options
+        .length,
+    ).toBe(2);
+  });
+}
+
+// --- Tests ---------------------------------------------------------------
+
+describe("Controls", () => {
+  beforeEach(() => {
+    mockStore.run_id = null;
+    mockStore.selectRun = vi.fn();
+    mockStore.stream.status = "idle";
+    mockClient.getConfig.mockReset();
+    mockClient.createRun.mockReset();
+    mockClient.cancelRun.mockReset();
+  });
+
+  it("renders ticker/date/depth/analysts/provider/model selects from config", async () => {
+    mockClient.getConfig.mockResolvedValue(makeConfig());
+    render(<Controls />);
+
+    await waitForConfig();
+
+    expect(screen.getByLabelText("股票代码")).toBeInTheDocument();
+    expect(screen.getByLabelText("分析日期")).toBeInTheDocument();
+    expect(screen.queryByLabelText("研究深度")).toBeNull();
+    expect(screen.queryByLabelText("研究模式")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("持仓数量")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("LLM Provider")).toBeInTheDocument();
+    expect(screen.getByLabelText("专项与挑战模型")).toBeInTheDocument();
+    expect(screen.getByLabelText("综合模型")).toBeInTheDocument();
+
+    expect(screen.queryByLabelText("market")).toBeNull();
+
+
+    // Provider select offers both providers; default is the configured one.
+    const providerSelect = screen.getByLabelText(
+      "LLM Provider",
+    ) as HTMLSelectElement;
+    expect(providerSelect.options.length).toBe(2);
+    expect(providerSelect).toHaveValue("deepseek");
+
+    // Default quick/deep models seeded from config.defaults.
+    expect(screen.getByLabelText("专项与挑战模型")).toHaveValue("deepseek-chat");
+    expect(screen.getByLabelText("综合模型")).toHaveValue(
+      "deepseek-reasoner",
+    );
+  });
+
+  it("resets quick/deep to the new provider's first option on provider change", async () => {
+    mockClient.getConfig.mockResolvedValue(makeConfig());
+    render(<Controls />);
+
+    await waitForConfig();
+
+    // Initial: deepseek -> deepseek-chat / deepseek-reasoner.
+    expect(screen.getByLabelText("专项与挑战模型")).toHaveValue("deepseek-chat");
+    expect(screen.getByLabelText("综合模型")).toHaveValue(
+      "deepseek-reasoner",
+    );
+
+    // Switch to openai.
+    fireEvent.change(screen.getByLabelText("LLM Provider"), {
+      target: { value: "openai" },
+    });
+
+    // openai quick/deep both only offer gpt-4o; selection resets to it.
+    await waitFor(() => {
+      expect(screen.getByLabelText("专项与挑战模型")).toHaveValue("gpt-4o");
+      expect(screen.getByLabelText("综合模型")).toHaveValue("gpt-4o");
+    });
+
+    const quickSelect = screen.getByLabelText(
+      "专项与挑战模型",
+    ) as HTMLSelectElement;
+    expect(quickSelect.options.length).toBe(1);
+    expect(quickSelect.options[0].value).toBe("gpt-4o");
+  });
+
+  it("uses fixed native roles and allows a scoped question", async () => {
+    mockClient.getConfig.mockResolvedValue(makeConfig());
+    mockClient.createRun.mockResolvedValue(makeSnapshot());
+    render(<Controls />);
+    await waitForConfig();
+    fireEvent.change(screen.getByLabelText("股票代码"), { target: { value: "600803" } });
+    fireEvent.change(screen.getByLabelText("补充关注点（可选）"), { target: { value: "核查现金流" } });
+    fireEvent.click(screen.getByRole("button", { name: /开始分析/ }));
+    await waitFor(() => expect(mockClient.createRun).toHaveBeenCalledTimes(1));
+    expect(mockClient.createRun.mock.calls[0][0]).toMatchObject({ research_profile: "evidence_v1", research_question: "核查现金流", research_depth: 1 });
+    expect(mockClient.createRun.mock.calls[0][0].selected_analysts).toEqual(["market", "social", "news", "fundamentals"]);
+  });
+
+  it("disables start when the selected provider is not configured", async () => {
+    const cfg = makeConfig();
+    cfg.defaults.llm_provider = "openai";
+    cfg.defaults.quick_think_llm = "gpt-4o";
+    cfg.defaults.deep_think_llm = "gpt-4o";
+    mockClient.getConfig.mockResolvedValue(cfg);
+    render(<Controls />);
+
+    await waitForConfig();
+
+    // Type a ticker so the only blocking error is provider-not-configured.
+    fireEvent.change(screen.getByLabelText("股票代码"), {
+      target: { value: "600803" },
+    });
+
+    expect(
+      screen.getByRole("button", { name: /开始分析/ }),
+    ).toBeDisabled();
+    expect(
+      screen.getByText(/所选 Provider 未配置 API Key/),
+    ).toBeInTheDocument();
+  });
+
+  it("disables start when native creation is disabled", async () => {
+    const cfg = makeConfig();
+    cfg.research_profiles!.evidence_v1!.supported = false;
+    mockClient.getConfig.mockResolvedValue(cfg);
+    render(<Controls />);
+    await waitForConfig();
+    fireEvent.change(screen.getByLabelText("股票代码"), { target: { value: "600803" } });
+    expect(screen.getByRole("button", { name: /开始分析/ })).toBeDisabled();
+    expect(screen.getByText(/此服务不支持新建证据研究/)).toBeInTheDocument();
+  });
+
+  it("calls createRun with the built DTO and selectRun with the returned run_id", async () => {
+    mockClient.getConfig.mockResolvedValue(makeConfig());
+    mockClient.createRun.mockResolvedValue(makeSnapshot());
+    render(<Controls />);
+
+    await waitForConfig();
+
+    fireEvent.change(screen.getByLabelText("股票代码"), {
+      target: { value: "600803" },
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: /开始分析/ }),
+      ).not.toBeDisabled();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /开始分析/ }));
+
+    await waitFor(() => {
+      expect(mockClient.createRun).toHaveBeenCalledTimes(1);
+    });
+
+    const body: RunCreateRequestDTO = mockClient.createRun.mock.calls[0][0];
+    expect(body).toMatchObject({
+      ticker: "600803",
+      llm_provider: "deepseek",
+      quick_think_llm: "deepseek-chat",
+      deep_think_llm: "deepseek-reasoner",
+      research_profile: "evidence_v1",
+      mode: "company_research",
+      research_depth: 1,
+      output_language: "Chinese",
+      checkpoint_enabled: false,
+      asset_type: null,
+    });
+    expect(body.selected_analysts).toEqual([
+      "market",
+      "social",
+      "news",
+      "fundamentals",
+    ]);
+
+    await waitFor(() => {
+      expect(mockStore.selectRun).toHaveBeenCalledWith("run_x");
+    });
+  });
+
+  // The per-ticker portfolio constraint UI was intentionally removed with the
+  // learning-mode pivot (dual-mode controls); no portfolio fields are sent.
+
+  it("submits actual custom model IDs after requiring both inputs", async () => {
+    const config = makeConfig();
+    config.providers[0].custom_model_allowed = true;
+    config.providers[0].models.quick.push({id:"custom",label:"Custom model ID"});
+    config.providers[0].models.deep.push({id:"custom",label:"Custom model ID"});
+    mockClient.getConfig.mockResolvedValue(config);
+    mockClient.createRun.mockResolvedValue(makeSnapshot());
+    render(<Controls />);
+    await waitForConfig();
+    fireEvent.change(screen.getByLabelText("股票代码"),{target:{value:"600803"}});
+    fireEvent.change(screen.getByLabelText("专项与挑战模型"),{target:{value:"custom"}});
+    fireEvent.change(screen.getByLabelText("综合模型"),{target:{value:"custom"}});
+    expect(screen.getByRole("button",{name:"开始分析"})).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("专项与挑战模型 ID"),{target:{value:"native-research-model"}});
+    fireEvent.change(screen.getByLabelText("综合模型 ID"),{target:{value:"native-synthesis-model"}});
+    fireEvent.click(screen.getByRole("button",{name:"开始分析"}));
+    await waitFor(()=>expect(mockClient.createRun).toHaveBeenCalledWith(expect.objectContaining({
+      ticker:"600803",quick_think_llm:"native-research-model",deep_think_llm:"native-synthesis-model"
+    })));
+  });
+
+  it("shows a VPN modal when a global ticker is blocked by the yfinance preflight", async () => {
+    const { ApiError } = await import("../../api/client");
+    mockClient.getConfig.mockResolvedValue(makeConfig());
+    mockClient.createRun.mockRejectedValue(
+      new ApiError({
+        code: "yfinance_unreachable",
+        message: "无法连接行情数据源（Yahoo Finance）。请开启 VPN 后重试。",
+        status: 503,
+      }),
+    );
+    render(<Controls />);
+
+    await waitForConfig();
+    fireEvent.change(screen.getByLabelText("股票代码"), {
+      target: { value: "AAPL" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /开始分析/ }));
+
+    // The VPN modal appears (not a plain inline error).
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toBeInTheDocument();
+    expect(screen.getByText(/需要开启 VPN/)).toBeInTheDocument();
+    // Backend message and the explanatory hint both mention the VPN.
+    expect(dialog.textContent).toContain("请开启 VPN 后重试");
+    expect(screen.getByText(/A 股无需 VPN/)).toBeInTheDocument();
+
+    // Dismissing via the button closes the modal.
+    fireEvent.click(screen.getByRole("button", { name: "知道了" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+  });
+});

@@ -1,0 +1,618 @@
+"""Append-only filesystem source of truth for localhost analysis history."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import threading
+import uuid
+from contextlib import suppress
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+from tradingagents.observability.canonical import canonical_business_value
+from tradingagents.observability.events import ArtifactRef, PersistedEvent, RunEventDraft
+from tradingagents.observability.redaction import redact_recursive
+from tradingagents.web.batch_models import BatchSnapshot, validate_batch_id
+
+from .run_models import RunSnapshot, RunSummary, utc_timestamp, validate_run_id
+
+ARTIFACT_KIND_DIRECTORIES = {
+    "data": "data",
+    "prompt": "prompts",
+    "tool-result": "tool-results",
+    "report-revision": "report-revisions",
+    "methodology-report": "methodology-reports",
+    "report-final": "reports",
+}
+ARTIFACT_KIND_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+FIXED_JSON_LOCATORS = frozenset(
+    {
+        "projections/reader-brief-v1.json",
+        "projections/run-view-v1.json",
+        "projections/debate-summary-v1.json",
+    }
+)
+
+
+class RunStoreError(RuntimeError):
+    pass
+
+
+class RunNotFound(RunStoreError):
+    pass
+
+
+class RunAlreadyExists(RunStoreError):
+    pass
+
+
+class RunStoreCorruption(RunStoreError):
+    pass
+
+
+class InvalidStorePath(RunStoreError):
+    pass
+
+
+def _extension_for_media_type(media_type: str) -> str:
+    return {
+        "application/json": ".json",
+        "text/markdown": ".md",
+        "text/plain": ".txt",
+    }.get(media_type, ".bin")
+
+
+class RunStore:
+    def __init__(self, root: str | Path | None = None):
+        self.root = Path(root or Path.home() / ".tradingagents" / "web" / "runs")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._global_lock = threading.RLock()
+        self._locks_guard = threading.Lock()
+        self._run_locks: dict[str, threading.RLock] = {}
+        # Process-local per-run latest-sequence watermarks. Every
+        # events.jsonl writer goes through this store instance under the
+        # per-run lock, so the cache stays exact between calls; without it
+        # each append/read re-scans the whole jsonl (O(N²) across a run).
+        self._sequence_watermarks: dict[str, int] = {}
+
+    def lock_for(self, run_id: str) -> threading.RLock:
+        validate_run_id(run_id)
+        with self._locks_guard:
+            return self._run_locks.setdefault(run_id, threading.RLock())
+
+    def _run_dir(self, run_id: str, *, must_exist: bool = True) -> Path:
+        try:
+            validate_run_id(run_id)
+        except ValueError as exc:
+            raise InvalidStorePath("invalid run_id") from exc
+        path = self.root / run_id
+        if path.parent.resolve() != self.root.resolve():
+            raise InvalidStorePath("run path escapes store root")
+        if must_exist and not path.is_dir():
+            raise RunNotFound(run_id)
+        return path
+
+    def create_run(self, snapshot: RunSnapshot) -> RunSnapshot:
+        run_dir = self._run_dir(snapshot.run_id, must_exist=False)
+        with self._global_lock, self.lock_for(snapshot.run_id):
+            try:
+                run_dir.mkdir(parents=False, exist_ok=False)
+            except FileExistsError as exc:
+                raise RunAlreadyExists(snapshot.run_id) from exc
+            try:
+                self._write_snapshot_file(run_dir, snapshot)
+                self._fsync_directory(run_dir)
+                self._fsync_directory(self.root)
+            except Exception:
+                # Leave a visible directory rather than deleting possible evidence.
+                raise
+        return snapshot
+
+    def _last_event_sequence_cached(self, run_id: str, run_dir: Path) -> int:
+        """Watermark over the run's last persisted event sequence.
+
+        The full events.jsonl scan runs once per run per process; afterwards
+        the in-memory watermark is maintained by append_event. Same-run
+        reads and appends serialize on the per-run lock, so a cached value
+        is never observed mid-append. delete_run evicts the entry.
+        """
+        cached = self._sequence_watermarks.get(run_id)
+        if cached is not None:
+            return cached
+        sequence = self._last_event_sequence(run_dir)
+        self._sequence_watermarks[run_id] = sequence
+        return sequence
+
+    def read_snapshot(self, run_id: str) -> RunSnapshot:
+        run_dir = self._run_dir(run_id)
+        with self.lock_for(run_id):
+            try:
+                payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError) as exc:
+                raise RunStoreCorruption(f"invalid run snapshot for {run_id}") from exc
+            snapshot = RunSnapshot.from_dict(payload)
+            latest_event = self._last_event_sequence_cached(run_id, run_dir)
+            if latest_event > snapshot.latest_sequence:
+                snapshot = replace(
+                    snapshot,
+                    latest_sequence=latest_event,
+                    updated_at=utc_timestamp(),
+                )
+                self._write_snapshot_file(run_dir, snapshot)
+            elif latest_event < snapshot.latest_sequence:
+                raise RunStoreCorruption(
+                    f"snapshot sequence {snapshot.latest_sequence} is ahead of events {latest_event}"
+                )
+            return snapshot
+
+    def write_snapshot_atomic(self, snapshot: RunSnapshot) -> RunSnapshot:
+        run_dir = self._run_dir(snapshot.run_id)
+        with self.lock_for(snapshot.run_id):
+            current = self.read_snapshot(snapshot.run_id)
+            if snapshot.latest_sequence < current.latest_sequence:
+                raise RunStoreError("snapshot latest_sequence cannot decrease")
+            self._write_snapshot_file(run_dir, snapshot)
+        return snapshot
+
+    def append_event(self, draft: RunEventDraft) -> PersistedEvent:
+        run_dir = self._run_dir(draft.run_id)
+        with self.lock_for(draft.run_id):
+            if draft.type == "run.completed":
+                complete_report = run_dir / "reports" / "complete_report.md"
+                final_report_artifact_id = draft.payload.get("final_report_artifact_id")
+                if not complete_report.is_file():
+                    raise RunStoreError(
+                        "run.completed requires an atomically published canonical report tree"
+                    )
+                expected_id = (
+                    "report-final:"
+                    f"{hashlib.sha256(complete_report.read_bytes()).hexdigest()}"
+                )
+                if final_report_artifact_id != expected_id:
+                    raise RunStoreError(
+                        "run.completed requires the complete report artifact id"
+                    )
+                if not isinstance(draft.payload.get("degraded_data_sources"), list):
+                    raise RunStoreError(
+                        "run.completed requires degraded_data_sources as a list"
+                    )
+                if not isinstance(draft.payload.get("completed_at"), str):
+                    raise RunStoreError("run.completed requires completed_at")
+            snapshot = self.read_snapshot(draft.run_id)
+            sequence = max(
+                snapshot.latest_sequence,
+                self._last_event_sequence_cached(draft.run_id, run_dir),
+            ) + 1
+            redacted_payload = redact_recursive(draft.payload)
+            payload = dict(redacted_payload.value)
+            if redacted_payload.manifest:
+                payload["redaction_manifest"] = [
+                    record.path for record in redacted_payload.manifest
+                ]
+            safe_draft = replace(draft, payload=payload)
+            event = PersistedEvent.from_draft(
+                safe_draft,
+                sequence,
+                timestamp=safe_draft.timestamp,
+            )
+            if event.type == "run.completed" and payload.get("completed_at") != event.timestamp:
+                raise RunStoreError(
+                    "run.completed completed_at must match the terminal event timestamp"
+                )
+            serialized = canonical_business_value(event.as_dict()).bytes + b"\n"
+            event_file = run_dir / "events.jsonl"
+            with event_file.open("ab", buffering=0) as handle:
+                handle.write(serialized)
+                os.fsync(handle.fileno())
+            self._fsync_directory(run_dir)
+            # Advance before any post-write validation can raise: the event
+            # is durable on disk, so the watermark must reflect it even if
+            # this call ends in RunStoreError.
+            self._sequence_watermarks[draft.run_id] = sequence
+
+            status = snapshot.status
+            if event.type.startswith("run.") and isinstance(payload.get("run_status"), str):
+                status = payload["run_status"]
+            updated = replace(
+                snapshot,
+                status=status,
+                latest_sequence=sequence,
+                updated_at=event.timestamp,
+            )
+            if event.type == "run.completed":
+                updated = replace(
+                    updated,
+                    final_signal=payload.get("final_signal")
+                    if isinstance(payload.get("final_signal"), str)
+                    else None,
+                    summary=payload.get("summary")
+                    if isinstance(payload.get("summary"), str)
+                    else None,
+                    error_category=None,
+                    final_report_artifact_id=str(payload["final_report_artifact_id"]),
+                    completed_at=event.timestamp,
+                    degraded_data_sources=tuple(payload["degraded_data_sources"]),
+                )
+            self._write_snapshot_file(run_dir, updated)
+            return event
+
+    def read_events(
+        self,
+        run_id: str,
+        *,
+        after: int = 0,
+        through: int | None = None,
+    ) -> list[PersistedEvent]:
+        if after < 0 or (through is not None and through < after):
+            raise ValueError("invalid event sequence range")
+        run_dir = self._run_dir(run_id)
+        event_file = run_dir / "events.jsonl"
+        if not event_file.exists():
+            return []
+        events: list[PersistedEvent] = []
+        expected = 1
+        try:
+            with event_file.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.endswith("\n"):
+                        raise RunStoreCorruption(
+                            f"unterminated event at line {line_number} for {run_id}"
+                        )
+                    payload = json.loads(line)
+                    event = PersistedEvent(**payload)
+                    if event.run_id != run_id or event.sequence != expected:
+                        raise RunStoreCorruption(
+                            f"non-contiguous event sequence at line {line_number} for {run_id}"
+                        )
+                    expected += 1
+                    if event.sequence > after and (
+                        through is None or event.sequence <= through
+                    ):
+                        events.append(event)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            if isinstance(exc, RunStoreCorruption):
+                raise
+            raise RunStoreCorruption(f"invalid event log for {run_id}") from exc
+        return events
+
+    def append_scratchpad(self, run_id: str, entry: Any) -> dict[str, Any]:
+        """Append one already-sanitized scratchpad entry beside ``events.jsonl``.
+
+        The caller owns semantic validation. This method guarantees a durable,
+        canonical JSONL append and never writes a second representation of raw
+        prompts, tool arguments, results, or private reasoning.
+        """
+        from pydantic import ValidationError
+
+        from tradingagents.observability.scratchpad import ScratchpadEntry
+
+        run_dir = self._run_dir(run_id)
+        model_dump = getattr(entry, "model_dump", None)
+        payload = model_dump(mode="json") if callable(model_dump) else dict(entry)
+        try:
+            validated = ScratchpadEntry.model_validate(payload)
+        except ValidationError as exc:
+            raise InvalidStorePath("invalid or unsafe scratchpad entry") from exc
+        if validated.run_id != run_id:
+            raise InvalidStorePath("scratchpad run_id does not match destination")
+        content = canonical_business_value(validated.model_dump(mode="json")).bytes + b"\n"
+        with self.lock_for(run_id):
+            destination = run_dir / "scratchpad.jsonl"
+            with destination.open("ab", buffering=0) as handle:
+                handle.write(content)
+                os.fsync(handle.fileno())
+            self._fsync_directory(run_dir)
+        return validated.model_dump(mode="json")
+
+    def read_scratchpad(self, run_id: str) -> list[dict[str, Any]]:
+        """Return the safe JSONL trace; corruption is surfaced like events."""
+        from pydantic import ValidationError
+
+        from tradingagents.observability.scratchpad import ScratchpadEntry
+
+        run_dir = self._run_dir(run_id)
+        destination = run_dir / "scratchpad.jsonl"
+        if not destination.exists():
+            return []
+        entries: list[dict[str, Any]] = []
+        try:
+            with destination.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.endswith("\n"):
+                        raise RunStoreCorruption(
+                            f"unterminated scratchpad entry at line {line_number} for {run_id}"
+                        )
+                    payload = json.loads(line)
+                    if not isinstance(payload, dict):
+                        raise RunStoreCorruption(
+                            f"invalid scratchpad entry at line {line_number} for {run_id}"
+                        )
+                    try:
+                        entry = ScratchpadEntry.model_validate(payload)
+                    except ValidationError as exc:
+                        raise RunStoreCorruption(
+                            f"unsafe scratchpad entry at line {line_number} for {run_id}"
+                        ) from exc
+                    if entry.run_id != run_id:
+                        raise RunStoreCorruption(
+                            f"invalid scratchpad entry at line {line_number} for {run_id}"
+                        )
+                    entries.append(entry.model_dump(mode="json"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            if isinstance(exc, RunStoreCorruption):
+                raise
+            raise RunStoreCorruption(f"invalid scratchpad log for {run_id}") from exc
+        return entries
+
+    def list_runs(self) -> list[RunSummary]:
+        """List summaries without replaying every run's event log.
+
+        ``append_event`` advances ``run.json`` in the same per-run critical
+        section as the durable event append. A history list only needs that
+        committed snapshot; validating every historical ``events.jsonl`` made
+        the common sidebar refresh scale with the total audit history.
+        """
+        summaries = []
+        with self._global_lock:
+            for path in self.root.iterdir():
+                if not path.is_dir():
+                    continue
+                try:
+                    validate_run_id(path.name)
+                    summaries.append(RunSummary.from_snapshot(self._read_snapshot_fast(path)))
+                except (ValueError, RunStoreError):
+                    continue
+        return sorted(
+            summaries,
+            key=lambda summary: (summary.created_at, summary.run_id),
+            reverse=True,
+        )
+
+    def create_batch(self, snapshot: BatchSnapshot) -> BatchSnapshot:
+        batches_dir = self.root / "batches"
+        batches_dir.mkdir(parents=True, exist_ok=True)
+        path = batches_dir / f"{snapshot.batch_id}.json"
+        with self._global_lock:
+            if path.exists():
+                raise RunAlreadyExists(snapshot.batch_id)
+            self._write_bytes_atomic(
+                path,
+                canonical_business_value(snapshot.as_dict()).bytes + b"\n",
+            )
+            self._fsync_directory(batches_dir)
+        return snapshot
+
+    def read_batch(self, batch_id: str) -> BatchSnapshot:
+        validate_batch_id(batch_id)
+        path = self.root / "batches" / f"{batch_id}.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise RunNotFound(batch_id) from exc
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RunStoreCorruption(f"invalid batch snapshot for {batch_id}") from exc
+        return BatchSnapshot.from_dict(payload)
+
+    def write_batch_atomic(self, snapshot: BatchSnapshot) -> BatchSnapshot:
+        validate_batch_id(snapshot.batch_id)
+        batches_dir = self.root / "batches"
+        batches_dir.mkdir(parents=True, exist_ok=True)
+        path = batches_dir / f"{snapshot.batch_id}.json"
+        with self._global_lock:
+            if not path.exists():
+                raise RunNotFound(snapshot.batch_id)
+            self._write_bytes_atomic(
+                path,
+                canonical_business_value(snapshot.as_dict()).bytes + b"\n",
+            )
+            self._fsync_directory(batches_dir)
+        return snapshot
+
+    def list_batches(self) -> list[BatchSnapshot]:
+        batches_dir = self.root / "batches"
+        if not batches_dir.is_dir():
+            return []
+        batches: list[BatchSnapshot] = []
+        with self._global_lock:
+            for path in batches_dir.glob("batch_*.json"):
+                try:
+                    batches.append(self.read_batch(path.stem))
+                except (RunNotFound, RunStoreCorruption, ValueError):
+                    continue
+        return sorted(batches, key=lambda batch: (batch.created_at, batch.batch_id), reverse=True)
+
+    def delete_batch(self, batch_id: str) -> None:
+        validate_batch_id(batch_id)
+        path = self.root / "batches" / f"{batch_id}.json"
+        with self._global_lock:
+            try:
+                path.unlink()
+            except FileNotFoundError as exc:
+                raise RunNotFound(batch_id) from exc
+            self._fsync_directory(path.parent)
+
+    def delete_run(self, run_id: str) -> None:
+        """Delete a run's persisted directory and its entire durable history."""
+        run_dir = self._run_dir(run_id)
+        with self._global_lock, self.lock_for(run_id):
+            if not run_dir.is_dir():
+                raise RunNotFound(run_id)
+            shutil.rmtree(run_dir)
+            self._sequence_watermarks.pop(run_id, None)
+            self._fsync_directory(self.root)
+
+    def write_fixed_json(self, run_id: str, locator: str, value: Any) -> None:
+        """Atomically materialize a versioned projection at an approved path.
+
+        These files are deterministic caches over append-only facts, not raw
+        agent artifacts. Their fixed names make a cheap read possible while
+        keeping all path construction server-owned.
+        """
+        if locator not in FIXED_JSON_LOCATORS:
+            raise InvalidStorePath("unsupported fixed JSON locator")
+        run_dir = self._run_dir(run_id)
+        destination = run_dir / locator
+        if destination.parent.parent.resolve() != run_dir.resolve():
+            raise InvalidStorePath("fixed JSON path escapes run directory")
+        content = canonical_business_value(value).bytes + b"\n"
+        with self.lock_for(run_id):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self._write_bytes_atomic(destination, content)
+            self._fsync_directory(destination.parent)
+            self._fsync_directory(run_dir)
+
+    def read_fixed_json(self, run_id: str, locator: str) -> dict[str, Any]:
+        if locator not in FIXED_JSON_LOCATORS:
+            raise InvalidStorePath("unsupported fixed JSON locator")
+        run_dir = self._run_dir(run_id)
+        destination = run_dir / locator
+        try:
+            value = json.loads(destination.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise RunNotFound(locator) from exc
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            raise RunStoreCorruption(f"invalid fixed JSON projection {locator}") from exc
+        if not isinstance(value, dict):
+            raise RunStoreCorruption(f"invalid fixed JSON projection {locator}")
+        return value
+
+    def store_artifact(
+        self,
+        run_id: str,
+        *,
+        kind: str,
+        value: Any,
+        media_type: str = "application/json",
+    ) -> ArtifactRef:
+        run_dir = self._run_dir(run_id)
+        if not ARTIFACT_KIND_PATTERN.fullmatch(kind):
+            raise InvalidStorePath("invalid artifact kind")
+        directory_name = ARTIFACT_KIND_DIRECTORIES.get(kind, kind)
+        artifact_dir = run_dir / directory_name
+        if artifact_dir.parent.resolve() != run_dir.resolve():
+            raise InvalidStorePath("artifact path escapes run directory")
+
+        if isinstance(value, bytes):
+            content = value
+        elif isinstance(value, str):
+            redacted = redact_recursive({"content": value}).value["content"]
+            content = redacted.encode("utf-8")
+        else:
+            content = canonical_business_value(value).bytes
+        digest = hashlib.sha256(content).hexdigest()
+        extension = _extension_for_media_type(media_type)
+        locator = f"{directory_name}/{digest}{extension}"
+        destination = run_dir / locator
+
+        with self.lock_for(run_id):
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            if not destination.exists():
+                self._write_bytes_atomic(destination, content)
+                self._fsync_directory(artifact_dir)
+        return ArtifactRef(
+            artifact_id=f"{kind}:{digest}",
+            kind=kind,
+            media_type=media_type,
+            content_sha256=digest,
+            byte_size=len(content),
+            locator=locator,
+        )
+
+    def read_artifact(self, run_id: str, artifact_id: str) -> bytes:
+        run_dir = self._run_dir(run_id)
+        try:
+            kind, digest = artifact_id.split(":", 1)
+        except ValueError as exc:
+            raise InvalidStorePath("invalid artifact_id") from exc
+        if not ARTIFACT_KIND_PATTERN.fullmatch(kind) or not SHA256_PATTERN.fullmatch(digest):
+            raise InvalidStorePath("invalid artifact_id")
+        directory_name = ARTIFACT_KIND_DIRECTORIES.get(kind, kind)
+        artifact_dir = run_dir / directory_name
+        if artifact_dir.parent.resolve() != run_dir.resolve():
+            raise InvalidStorePath("artifact path escapes run directory")
+        if artifact_dir.is_dir() and kind == "report-revision":
+            matches = list(artifact_dir.rglob(f"*-{digest}.md"))
+        elif artifact_dir.is_dir() and kind == "report-final":
+            matches = list(artifact_dir.rglob("*.md"))
+        else:
+            matches = list(artifact_dir.glob(f"{digest}.*")) if artifact_dir.is_dir() else []
+        if not matches or any(not match.is_file() for match in matches):
+            raise RunNotFound(f"artifact {artifact_id}")
+        contents = [match.read_bytes() for match in matches]
+        matching_contents = [
+            content
+            for content in contents
+            if hashlib.sha256(content).hexdigest() == digest
+        ]
+        if kind == "report-final":
+            if not matching_contents:
+                raise RunNotFound(f"artifact {artifact_id}")
+            return matching_contents[0]
+        if len(matching_contents) != len(contents):
+            raise RunStoreCorruption(f"artifact {artifact_id} failed integrity check")
+        return matching_contents[0]
+
+    def _write_snapshot_file(self, run_dir: Path, snapshot: RunSnapshot) -> None:
+        raw = snapshot.as_dict()
+        redacted = redact_recursive(raw)
+        payload = dict(redacted.value)
+        existing_manifest = set(payload.get("redaction_manifest") or [])
+        existing_manifest.update(record.path for record in redacted.manifest)
+        payload["redaction_manifest"] = sorted(existing_manifest)
+        content = canonical_business_value(payload).bytes + b"\n"
+        self._write_bytes_atomic(run_dir / "run.json", content)
+        self._fsync_directory(run_dir)
+
+    @staticmethod
+    def _read_snapshot_fast(run_dir: Path) -> RunSnapshot:
+        """Read only the atomically maintained snapshot used for list views."""
+        try:
+            payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            return RunSnapshot.from_dict(payload)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RunStoreCorruption(f"invalid run snapshot for {run_dir.name}") from exc
+
+    @staticmethod
+    def _write_bytes_atomic(destination: Path, content: bytes) -> None:
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb", buffering=0) as handle:
+                handle.write(content)
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            with suppress(FileNotFoundError):
+                temporary.unlink()
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _last_event_sequence(run_dir: Path) -> int:
+        event_file = run_dir / "events.jsonl"
+        if not event_file.exists() or event_file.stat().st_size == 0:
+            return 0
+        last_sequence = 0
+        try:
+            with event_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.endswith("\n"):
+                        raise RunStoreCorruption("unterminated final event")
+                    payload = json.loads(line)
+                    last_sequence = int(payload["sequence"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, RunStoreCorruption):
+                raise
+            raise RunStoreCorruption("unable to read latest event sequence") from exc
+        return last_sequence

@@ -1,0 +1,214 @@
+/**
+ * F2 - React hook binding the run reducer to the live SSE stream.
+ *
+ * Lifecycle per run_id:
+ *   mount / run_id change -> status "loading"
+ *   getRun(run_id) resolves -> dispatch snapshot -> status "replaying"
+ *   openRunStream(run_id, 0, ...) -> live events fold into reducer
+ *   terminal event or stream close -> if terminal, status "closed"; else
+ *     reconnect after a short backoff to recover any events the broker live
+ *     queue missed (resilience against fast runs / transport drops).
+ *   run_id === null -> status "idle", state reset.
+ */
+import { useEffect, useReducer, useRef, useState } from "react";
+import type { ReducerState } from "../state/model";
+import type { PersistedEventDTO, RunSnapshotDTO } from "../api/contracts";
+import { getRun } from "../api/client";
+import { openRunStream } from "../api/eventSource";
+import type { SseSubscription, SseHttpError } from "../api/eventSource";
+import { createInitialState, runReducer } from "../state/runReducer";
+import type { ReducerAction } from "../state/runReducer";
+
+export type RunStreamStatus =
+  | "idle"
+  | "loading"
+  | "live"
+  | "replaying"
+  | "closed"
+  | "error";
+
+export interface UseRunStreamResult {
+  state: ReducerState | null;
+  status: RunStreamStatus;
+  error: Error | null;
+}
+
+const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
+// Exponential backoff: 0.5s, 1s, 2s, ... capped at 10s. A dropped transport
+// or server restart should not be hammered at a fixed cadence.
+const RECONNECT_BASE_DELAY_MS = 500;
+const RECONNECT_MAX_DELAY_MS = 10_000;
+const MAX_RECONNECTS = 20;
+
+function reconnectDelayMs(reconnectCount: number): number {
+  return Math.min(RECONNECT_BASE_DELAY_MS * 2 ** Math.max(reconnectCount - 1, 0), RECONNECT_MAX_DELAY_MS);
+}
+
+/**
+ * Duck-typed status probe: eventSource attaches `status` to HTTP failures
+ * (SseHttpError). A structural check keeps this hook independent of the
+ * transport module's runtime exports, so test doubles stay trivial.
+ */
+function sseHttpStatus(err: Error): number | null {
+  const status = (err as Partial<SseHttpError>).status;
+  return typeof status === "number" ? status : null;
+}
+
+export function useRunStream(run_id: string | null): UseRunStreamResult {
+  const [state, dispatch] = useReducer(
+    runReducer as (s: ReducerState, a: ReducerAction) => ReducerState,
+    createInitialState(),
+  );
+  const [status, setStatus] = useState<RunStreamStatus>(
+    run_id === null ? "idle" : "loading",
+  );
+  const [error, setError] = useState<Error | null>(null);
+  const subscriptionRef = useRef<SseSubscription | null>(null);
+  const closedRef = useRef(false);
+  const lastSeqRef = useRef(0);
+  const reconnectCountRef = useRef(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (run_id === null) {
+      closedRef.current = false;
+      const sub = subscriptionRef.current;
+      if (sub) {
+        sub.close();
+        subscriptionRef.current = null;
+      }
+      dispatch({ type: "reset" });
+      setStatus("idle");
+      setError(null);
+      return;
+    }
+
+    const id: string = run_id;
+    closedRef.current = false;
+    let cancelled = false;
+    setStatus("loading");
+    setError(null);
+
+    // Shared backoff path for both a clean stream close and a stream error:
+    // re-fetch the snapshot to decide whether the run is done (terminal AND
+    // all events seen) or the transport should be re-established from the
+    // last seen sequence to drain whatever was missed.
+    const scheduleReconnect = (): void => {
+      if (cancelled || closedRef.current) return;
+      if (reconnectCountRef.current >= MAX_RECONNECTS) {
+        setStatus("error");
+        setError(new Error("SSE reconnected too many times without reaching a terminal state"));
+        return;
+      }
+      reconnectCountRef.current += 1;
+      reconnectTimerRef.current = setTimeout(() => {
+        if (cancelled || closedRef.current) return;
+        getRun(id)
+          .then((snap: RunSnapshotDTO) => {
+            if (cancelled || closedRef.current) return;
+            // Do NOT dispatch({type:"snapshot"}) here. The snapshot action
+            // returns createInitialState(snapshot) -- only meta+roles --
+            // which would wipe the turns/timeline/tool_calls already
+            // replayed into state (Bug 1: viewing a completed history run
+            // made the timeline vanish ~800ms after SSE replay finished).
+            // Reconnect only needs to know whether the run reached a
+            // terminal status with all events seen; otherwise re-subscribe
+            // from the last seen sequence and let live/replayed events
+            // update state normally.
+            if (
+              TERMINAL_RUN_STATUSES.has(snap.status) &&
+              snap.latest_sequence <= lastSeqRef.current
+            ) {
+              // Terminal and we have seen every event.
+              setStatus("closed");
+              return;
+            }
+            // Either still running, or terminal but we missed events:
+            // re-subscribe from the last seen sequence.
+            streamFrom(lastSeqRef.current);
+          })
+          .catch((err: unknown) => {
+            if (cancelled || closedRef.current) return;
+            setError(err instanceof Error ? err : new Error(String(err)));
+            setStatus("error");
+          });
+      }, reconnectDelayMs(reconnectCountRef.current));
+    };
+
+    const streamFrom = (after: number): void => {
+      if (cancelled || closedRef.current) return;
+      const subscription = openRunStream(id, after, {
+        onEvent: (event: PersistedEventDTO) => {
+          if (cancelled || closedRef.current) return;
+          lastSeqRef.current = Math.max(lastSeqRef.current, event.sequence);
+          dispatch({ type: "event", event });
+          setStatus("live");
+        },
+        onClose: () => {
+          if (cancelled || closedRef.current) return;
+          // The stream closed without a terminal event; the shared backoff
+          // path re-checks the snapshot before re-establishing transport.
+          scheduleReconnect();
+        },
+        onError: (err: Error) => {
+          if (cancelled || closedRef.current) return;
+          // A 4xx is a permanent boundary rejection (run deleted, bad id):
+          // retrying cannot succeed, so fail fast instead of burning the
+          // reconnect budget. Everything else -- 5xx, dropped transport,
+          // malformed frames -- recovers through the same snapshot-checked
+          // backoff path as a clean close.
+          const httpStatus = sseHttpStatus(err);
+          if (httpStatus !== null && httpStatus >= 400 && httpStatus < 500) {
+            setError(err);
+            setStatus("error");
+            return;
+          }
+          scheduleReconnect();
+        },
+      });
+      if (cancelled || closedRef.current) {
+        subscription.close();
+        return;
+      }
+      subscriptionRef.current = subscription;
+    };
+
+    getRun(id)
+      .then((snapshot: RunSnapshotDTO) => {
+        if (cancelled || closedRef.current) return;
+        lastSeqRef.current = 0;
+        reconnectCountRef.current = 0;
+        dispatch({ type: "snapshot", snapshot });
+        if (TERMINAL_RUN_STATUSES.has(snapshot.status)) {
+          // A completed history run still needs its persisted event facts for
+          // role selection, output artifacts, and the right-hand inspector.
+          // Replay is read-only and does not re-run the analysis.
+          setStatus("replaying");
+          streamFrom(0);
+          return;
+        }
+        setStatus("replaying");
+        streamFrom(0);
+      })
+      .catch((err: unknown) => {
+        if (cancelled || closedRef.current) return;
+        setError(err instanceof Error ? err : new Error(String(err)));
+        setStatus("error");
+      });
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      const sub = subscriptionRef.current;
+      if (sub) {
+        sub.close();
+        subscriptionRef.current = null;
+      }
+    };
+  }, [run_id]);
+
+  return { state, status, error };
+}

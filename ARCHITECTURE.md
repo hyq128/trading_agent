@@ -1,0 +1,333 @@
+# TradingAgents Architecture
+
+Status: Current
+
+This is the current-state architecture map. Canonical machine contracts remain
+in the referenced Python and TypeScript models; plans and reviews are not a
+source of runtime truth.
+
+## Consumers And Entry Flow
+
+The maintained product entry is the Web workbench. Its adapters delegate to the
+consumer-neutral execution layer; legacy callers retain compatibility paths:
+
+- `cli/main.py` launches Web through `tradingagents web`. CLI analysis is legacy code outside continued product maintenance.
+- `tradingagents/web/` is the loopback-only FastAPI workbench. It creates and
+  reads runs, streams durable events through SSE, and serves the bundled SPA.
+- Programmatic callers use the consumer-neutral execution boundary: classic
+  constructs `TradingAgentsGraph`, while explicit native research uses
+  `NativeRunner` with its durable observer and publication authorizer.
+
+Each analysis binds its effective dataflow configuration to the run's execution
+context, so concurrent Web runs route through their own configured providers.
+Optional DeepSeek effort overrides are keyed by actual call task in
+`llm_clients/task_effort.py`. Native/catalyst executors freeze configuration
+before source collection; classic roles with explicit overrides use separate
+clients, while news helpers bind immutable invocation settings. Task policies
+participate in saved effective configuration and resume identity. Effort overrides
+do not add model phases or change default effort; see
+[reasoning configuration](docs/operations/llm-reasoning.md).
+
+The Web `chatgpt` provider injects a shared official SIWC authentication service
+into `NativeRunner`/`NativeModelCaller`. `llm_clients/chatgpt_auth.py` owns OAuth,
+protected registrations, refresh rotation and account-specific model catalogs;
+`chatgpt_client.py` owns the fixed streamed Responses route. Runs freeze only a
+non-secret account reference. Credentials live outside run artifacts; safe
+failure diagnostics and measured token usage are checkpointed for projections.
+See [ChatGPT subscription operations](docs/operations/chatgpt-subscription.md).
+
+## Native Research Architecture
+
+```text
+Web form / API -> manager and scheduler -> NativeRunner
+  -> qualified, frozen source evidence -> native research kernel
+  -> validated research-record-v1 -> local run store -> Reader / Markdown
+```
+
+The maintained kernel is `graph/native_research.py`. Operating, event and
+market specialists receive separate frozen fact views and cannot read each
+other's drafts. Outputs merge in a fixed role order before independent challenge,
+bounded verification and synthesis. Independence means task-context isolation,
+not statistical independence or a guarantee of correctness.
+`NativeRunner` calls this Python kernel directly, with bounded specialist workers
+and a durable ledger; the retained classic workflow uses LangGraph.
+
+Models propose evidence-bound hypotheses, counterarguments and dimensional
+judgements. The code host owns source qualification, input/reference validation,
+deterministic calculations, execution limits and durable publication. Missing
+inputs remain explicit; a successful computable check cannot establish economic
+causality. The canonical boundaries are in `agents/schemas/` and `research/`;
+see the [contract index](docs/contracts/README.md) for producers and consumers.
+
+New Web single and batch requests default to `evidence_v1` and route to
+`execution/native_runner.py:NativeRunner`. The React creation form offers one company investment research workflow, with an optional supplementary focus. Historical catalyst/holding modes remain read/resume only; fresh creation/retry of those modes returns 422.
+Roles and challenge count are code-owned. Old-profile creation and retry return
+410; legacy read/resume stays available. `TRADINGAGENTS_EVIDENCE_ENABLED=false`
+disables fresh native work without disabling reads or existing recovery.
+
+The `evidence-policy-v1` fixes source windows separately from outlook and runtime
+horizon policy. New workflow `evidence-production-v7` retains V5 collection through
+`dataflows/minimum_sources.py:MinimumEvidenceSources`, an isolated extension of
+the native collector. `disclosure_documents_v2.py` admits bounded official
+reports/summary/operating notices and explicit numeric rows; supplementary
+valuation parses dated institution EPS and same-session industry candidates.
+`research/minimum_evidence.py` recomputes three closed checks from frozen V0.
+The critic selects optional check/risk/date bindings; the host owns assessment
+v2 outcomes and keeps economic parent questions unresolved. Saved record
+validation recomputes checks and challenge outcomes, so Reader/exports cannot
+relabel a successful data check as resolved economics. V5 introduced these
+checks without an extra model stage. V6 freezes the independent baseline first,
+then optionally answers the user focus once through `execution/native_focus.py`.
+The collector and core kernel never receive that focus. `research/native_versions.py`
+owns V6 frozen mode objectives and V7 investment objective/kernel/budget identity. V7 adds one bounded targeted reply per challenged specialist before synthesis, a versioned dialogue and V3 investment assessment. Fresh V7 identities freeze a company policy for timestamped current-session valuation, cautious judgement with missing valuation anchors, and role-local enumerated model references. Older identities retain their admission, prompts and judgement gates. Old V1–V6 prompts, roles, budgets and report semantics remain versioned. See the [unified research contract](docs/contracts/unified-company-research.md).
+
+Workflow `evidence-production-v4` uses `dataflows/native_valuation.py:ValuationSources`,
+which extends the v3 bounded disclosures collector with qualified valuation
+sources before optional documents. `research/native_valuation.py` admits source
+fields and assembles deterministic inputs for the existing pure valuation chain.
+The optional record valuation includes saved inputs, input hash, evidence IDs,
+recomputed assessment and limitations. Company/holding valuation claims are
+restricted to valuation facts; synthesis receives allowed claim IDs per dimension.
+V4 validates dimension references during the existing bounded model repair
+opportunity. Failed synthesis remains explicitly partial, without relaxed gates.
+
+V4 and its original valuation chain remain recoverable. V3 uses `native_disclosures.py`; V2 uses `native_sources.py`; V1 uses
+`catalyst_sources.py`. Recovery retains each collector and its original
+facts/views/policy/kernel/prompt semantics, or replays saved V0/output. Source
+families, publication times, global coverage and specialist scope remain distinct.
+See [native source policy](docs/operations/evidence-research.md#evidence-and-workflow).
+
+## Legacy Workflow And Research Routing
+
+The legacy neutral classic flow is:
+
+```text
+AnalysisRequest -> TradingAgentsGraph -> AnalysisRunner -> LangGraph workflow
+```
+
+`AnalysisRequest` and `AnalysisResult` in
+`tradingagents/execution/models.py` define the shared input/output boundary.
+`TradingAgentsGraph` validates effective configuration, builds tools and a
+workflow, and delegates run execution to `AnalysisRunner`. The runner resolves
+run context, creates state, invokes or streams LangGraph, handles cancellation
+and checkpoint coordination, then returns a result.
+
+`tradingagents/graph/setup.py` builds a deterministic prefix before analysis:
+adjusted-price, news-window, and fundamentals prefetch tasks always run; the
+A-share supplement task runs when a selected analyst needs it. Selected market,
+social, news, and fundamentals analysts then execute in their requested order.
+The Evidence Steward gates the Bull/Bear research debate; a gate error ends the
+workflow instead of manufacturing a decision.
+
+Bull and Bear debate through the Research Manager. The classic profile accepts
+the typed modes `company_research` and `holding_review`; both route
+from Research Manager directly to Portfolio Manager, and the runner reports the
+`research_only` signal. The former Trader and three-role risk debate have been
+retired from the execution graph; older state and report fields may remain for
+compatibility. This routing is defined in `graph/setup.py`; do not infer it from
+an older report layout or UI projection.
+
+Research runs use a deterministic evidence registry and data-window plan to
+assemble `ResearchCaseV2` from a validated draft when possible. The same typed
+run also promotes a `research-package-v1` artifact after the research case
+commit. The package is a public, provider-neutral fact layer containing the
+code-owned metric dictionary, current-run evidence labels, and explicit
+unknowns; structured observations, peer comparisons, and logic edges are added
+only when their inputs pass point-in-time and evidence validation. Failures
+retain an explicit partial or fail-stop artifact rather than pretending complete
+coverage. The thesis-diff code compares committed research cases; derived
+artifacts are promoted only after durable graph commit barriers.
+
+## Publication And Projections
+
+### Legacy Catalyst Publication
+
+The following describes retained `catalyst_v1` execution and recovery. Current
+native publication is described below.
+
+Catalyst freezes one cutoff-qualified evidence draft, then executes three
+specialists, independent refutation and one synthesis. Model proposals pass
+the canonical `CatalystResearchCase` validation and deterministic priority
+ceiling. Its model adapter reuses configured quick/deep clients, disables SDK
+retries and charges every dispatch. Process-wide model and data concurrency
+ceilings are two each. Active execution defaults to 300 seconds, excluding
+scheduler queue time.
+
+The bounded price path admits directly observed Tushare REST attempts. It
+validates daily bars, dated factors and complete settled-session calendars,
+anchors OHLC to the last price session, and rejects unverified retrospective
+factor vintage. Code-computed risk and ATR statistics are included in the
+frozen price evidence payload, with independent sample/input degradation;
+saved results are projected into the additive `research-record-v1` contract
+and the Reader's quantitative context, independently of valuation.
+
+`runtime/catalyst_checkpoint.py` persists attempt transitions, source results,
+frozen inputs, prompt digests, role results, stage status and the final candidate
+as committed run artifacts. Recovery checks identity and integrity, reuses saved
+results and counts uncertain dispatched attempts as spent. The catalyst frontier
+is always durable; `checkpoint_enabled` controls classic LangGraph checkpoints.
+The catalyst evidence policy does not extend the horizon runtime-policy enum.
+
+The manager arbitrates cancellation and durable publication authorization
+under the same lifecycle lock. Cancellation first forbids publication;
+authorization first starts terminalization and rejects late cancellation.
+A crash after authorization resumes from the saved candidate. The committed
+`catalyst-research-case-v1` artifact has a durable parent; its Markdown report is
+derived from that same case. No classic debate-summary call is scheduled.
+
+`/api/runs/{id}/catalyst` projects the committed case and durable stage facts.
+Reading, refreshing and reconnecting do not invoke models or providers.
+`ready`, run completion, evidence completeness and quality are separate axes.
+The SPA retains these historical case readers. New creation uses the native form. See
+[catalyst operations](docs/operations/catalyst-research.md) for qualification limits.
+
+### Shared Projections And Native Publication
+
+`observability/` records run events and graph-task candidates. `execution/`
+promotes committed state, public role outputs, evidence bundles, report
+revisions, `research-case-v2`, `thesis-diff-v1`, and the derived
+`valuation-assessment-v1` position chain artifact. `runtime/` owns the
+durable run store, reconciliation, resume fingerprints, and final report
+publication.
+
+The FastAPI adapter exposes raw run/artifact access plus read-only projections:
+the Reader (`/api/runs/{id}/reader`), the structured package
+(`/api/runs/{id}/reader/package`), run view, audit views, and market views.
+The shared record (`/api/runs/{id}/reader/record`) adapts committed company,
+holding and catalyst cases into source content, claims, hypotheses, challenges,
+verification records and metrics. It checks artifact and source-case integrity;
+historical absence remains explicit, without backfill. Current adapters label
+inferences as converted and never treat model dispositions as executed tool
+verification. `execution/verification_executor.py` provides a
+bounded round for native V0 records in all three modes. It uses
+the existing durable ledger, saves predicate-scoped results and V1 lineage,
+and replays saved output without work. The native kernel in
+`graph/native_research.py` connects facts-only V0, isolated specialists,
+one challenge, C1 and dimension-gated synthesis. Its SDK adapter and mandatory
+record publisher live in `execution/native_model.py` and
+`execution/native_publication.py`. `NativeRunner` supplies the bounded collector,
+saved V0, role lifecycle events, deadline and shared cancellation/publication
+authorization. The Web manager creates, retries and resumes native runs with
+profile-specific identity guards; native checkpoints do not depend on the
+classic checkpoint toggle. Unknown dispatched calls remain spent and are not
+automatically repeated. Persisted adapter responses can recover the gap before
+the kernel's MAIN result without another model call.
+
+For V7, the adapter checks condition evidence against its own hypothesis before
+saving specialist proposals; the kernel repeats that shared rule at merge.
+`execution/native_references.py` gives fresh synthesis requests deterministic
+prompt-local aliases, restored to canonical IDs before unchanged record gates
+and caching. Frozen prompts retain their original format. Binding guidance and
+safe repair feedback remain within the existing repair budget; see the
+[unified research contract](docs/contracts/unified-company-research.md).
+
+Fresh V7 identities also freeze the specialist reference-isolation policy.
+After one bounded repair fails or is refused, the adapter can preserve only
+the original schema-valid hypotheses whose references pass the shared rule.
+Durable candidate/acceptance envelopes retain original indices and closed
+rejection reasons; the kernel and Reader use the same binding. Effective
+rejections produce partial/LOW_CONFIDENCE output. Cancellation, deadlines and
+checkpoint conflicts do not trigger this fallback. Legacy identities keep
+their adapter behavior and saved prompts.
+
+Fresh V7 identities freeze `execution/native_retry.py`'s model retry policy.
+The adapter permits three transient retries per call with 2/5/10-second waits,
+bounded by the existing shared three-retry/twelve-attempt ledger limits. Repair
+retries retain their origin and each SDK request owns its usage exactly once;
+Reader counts include retry authorizations. Historical identities without this
+policy retain their original behavior, and the optional focus remains one call.
+See [retry accounting](docs/operations/observability-replay.md#原生模型有限网络重试).
+
+Native publication requires an assessed `research-record-v1` and its durable
+authorization barrier; failure cannot complete the run or fall back to a case.
+Fresh V7 identities freeze a separate report-delivery policy. The optional
+`company_basics` pack binds public profile, fundamental and quantitative fields
+to saved facts. `research/report_delivery.py` restores host-owned copied
+synthesis bindings and assembles effective saved findings after unusable
+synthesis. V3 `report_status` separates delivery from coverage; an unfinished
+synthesis report has a null stance and preserves all source/reply provenance.
+Historical serialization and identities remain unchanged. See the
+[unified contract](docs/contracts/unified-company-research.md).
+Markdown and the single native Reader consume that same record. The desktop
+V7 Reader starts with the independent scope, investment stance, referenced support/counterevidence and original falsifiers, then key claims, primary
+challenge and proposed next check, executed checks, valuation and quantitative
+context. Linked facts, source content and fixed concept explanations appear in
+a side panel or narrow-container drawer. Evidence, process, Agent outputs and
+the complete record are explicit navigation destinations. The optional response
+appears last; historical reports keep their original question-led presentation.
+`research-focus-response-v1` is a separate closed artifact bound to the frozen
+baseline digest. `execution/native_focus_publication.py` commits it only after
+the mandatory record, using the same lifecycle authorization. Durable publication
+dispositions make local optional failure stable across report generation and
+recovery. Cancellation or global persistence corruption still fails the run.
+
+`web/reader_process_models.py` owns the additive process and per-role DTOs.
+`web/reader_process_projection.py` captures an event-sequence boundary, validates
+the native workflow/input/output/seed identities and maps proposals to their
+published IDs. `web/native_reader_versions.py` freezes read qualification for
+the supported saved V1–V7 workflows; unknown versions or failed bindings degrade
+without exposing unqualified proposals. The process endpoint reads summary
+metadata; the selected-role endpoint returns only closed research schema fields,
+never prompts, adapter responses or checkpoint envelopes. Both are read-only.
+`runtime/native_observation.py` records SDK observation coverage before MAIN
+authorization for new SDK-adapter runs. Public process DTOs retain separate
+budget, SDK main/focus/repair, data-capability and HTTP authorizations; the UI
+shows these only in Audit technical troubleshooting. Audit defaults to public
+research availability, failed-role explanations and limitations; main stage
+reviews omit execution counts. Legacy incomplete
+coverage is nullable or a lower bound. This marker does not change recovery
+identity, prompts, role selection or the research record. The separate
+`/reader/focus` projection validates committed supplemental bytes and their
+checkpoint barrier at the selected sequence; it never serves a saved candidate.
+V6 and V7 focus have one dedicated model bucket within the unchanged twelve total
+attempts. It has no repair, retry or tool access and uses remaining active time;
+optional timeout allows publication of the already-completed baseline.
+
+Completion, readability, completeness and quality remain separate. Missing
+valuation constrains investment stance; historical original-thesis inputs constrain holding review, and a
+successful condition check cannot close an economic challenge. Web creation
+already defaults to native research; paid accuracy evaluation remains a separate
+acceptance task. See [Web research operations](docs/operations/evidence-research.md) and
+[the contract](docs/contracts/research-record.md).
+`frontend/src/api/contracts.ts` is the TypeScript facade for those wire
+contracts. The client consumes server-projected data; it does not define the
+domain schema or recover unavailable evidence by making provider calls.
+
+## Persistence
+
+Default local data is under `~/.tradingagents/`:
+
+| Purpose | Default location |
+| --- | --- |
+| Reports and non-web logs | `~/.tradingagents/logs/` |
+| Data cache and LangGraph checkpoints | `~/.tradingagents/cache/` |
+| Legacy decision memory (read-only; the write side was retired, only parsing and prompt injection remain) | `~/.tradingagents/memory/trading_memory.md` |
+| Durable Web run records | `~/.tradingagents/web/runs/` |
+| Web server log | `~/.tradingagents/web/logs/server.log` |
+
+The run store writes snapshots, append-only events, artifacts, report
+revisions, and final reports per run. These are local user records, not source
+fixtures or disposable development output.
+
+## Module Ownership And Extension Points
+
+| Need | Primary owner | Extension rule |
+| --- | --- | --- |
+| Input/result or cancellation behavior | `execution/` | Evolve typed models before adapters. |
+| Role sequence, routing, tools | `graph/` and `agents/` | Preserve policy-owned prefetch and evidence gates. |
+| Provider capability or market data | `dataflows/` | Add a provider behind typed, source-labelled results. |
+| Evidence-bound research artifact | `agents/schemas/` and `research/` | Bind claims to evidence; retain explicit degradation. |
+| Durable runs, checkpoints, replay | `runtime/` and `observability/` | Keep events/artifacts durable and compatibility-aware. |
+| HTTP, SSE, Reader/Audit UI | `web/` and `frontend/` | Adapt canonical contracts; do not reverse the dependency. |
+
+New adapters may call execution/runtime boundaries. Execution may coordinate
+graph, dataflows, research, runtime, and observability. Core domain modules
+must not import FastAPI, SSE, React, or browser contract types. Provider code
+belongs in `dataflows/`, not graph routing or UI projection modules.
+
+## Runtime Policy
+
+The current production runtime contract is `horizon-policy-v2`, selected by
+`PRODUCTION_RUNTIME_CONTRACT` in `tradingagents/runtime/contracts.py`.
+`horizon-policy-v3` is currently an internal test-gated selection requiring
+injected preflight inputs; it is not production runtime policy.

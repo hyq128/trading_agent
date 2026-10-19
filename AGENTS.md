@@ -1,0 +1,125 @@
+# TradingAgents Working Guide
+
+This file is the operational entry point for contributors and coding agents.
+Read [README.md](README.md) ([English](README.en.md)) for product orientation, [ARCHITECTURE.md](ARCHITECTURE.md)
+for the current system map, and [docs/README.md](docs/README.md) for detailed
+references.
+
+## Reading And Documentation Ownership
+
+Start here, then read the scoped `AGENTS.md` for the files being changed.
+Use the architecture and documentation index to find the owning contract and
+inspect its canonical code before changing behavior. New Web research uses
+`evidence_v1`; classic/catalyst paths in older documents are compatibility paths.
+
+- `README.md` is the concise Chinese product overview; `README.en.md` is its
+  English counterpart and the package long description. Keep their structure,
+  capabilities and limitations aligned. `README.zh-CN.md` preserves the old link.
+- Keep the README focused on purpose, architecture, Agent design, highlights,
+  startup and major limitations. Detailed budgets, versioned workflow rules,
+  endpoint errors and recovery belong in the indexed operations/contracts docs.
+- `ARCHITECTURE.md` owns the current module map; this file and scoped guides own
+  contribution rules. Plans and dated reviews retain their writing-time facts.
+
+## Repository Map
+
+- `cli/`: Typer commands and interactive terminal adapter.
+- `tradingagents/`: Python package. See [tradingagents/AGENTS.md](tradingagents/AGENTS.md).
+- `tradingagents/skills/`: fork-local research-methodology library (Markdown skills with a
+  code-owned role mapping). Not upstream content; role selection is code-owned and must not
+  be changed by Markdown edits or presets. See `tradingagents/skills/registry.py`.
+- `frontend/`: React workbench source. See [frontend/AGENTS.md](frontend/AGENTS.md).
+- `tradingagents/web/static/`: generated SPA assets served by the Python package.
+- `tests/`, frontend test files, and `frontend/e2e/`: tracked contributor tests
+  available in fresh clones. They run locally and are not required to use the
+  installed Web product.
+- `docs/`: focused operational references, plans, and reviews. Plans and reviews are not
+  current-state architecture sources.
+
+## Setup And Commands
+
+Python 3.10 or newer is required. For local work, reuse the existing Conda
+environment named `tradingagents`; do not create a venv unless the user requests
+one. A contributor install with development tooling is:
+
+```bash
+conda activate tradingagents
+python -m pip install -e ".[china,web,dev]" --index-url https://pypi.org/simple
+```
+
+Baseline contributor checks are:
+
+```bash
+python scripts/check_agent_docs.py
+ruff check tradingagents cli scripts/check_agent_docs.py
+npm --prefix frontend ci
+npm --prefix frontend run typecheck
+npm --prefix frontend run build
+```
+
+Run the applicable tracked tests for the changed layer:
+
+```bash
+python -m pytest
+python -m pytest -m unit
+npm --prefix frontend run test -- --run
+npm --prefix frontend run test:e2e
+```
+
+For first-time end-to-end setup, install Playwright Chromium from `frontend/`
+with `npx playwright install chromium`, and build the SPA before running tests.
+The fixture server needs the contributor Python environment; set
+`TRADINGAGENTS_E2E_PYTHON` when `python` resolves elsewhere. See
+[scoped validation](CONTRIBUTING.md#scoped-validation).
+
+The maintained user entry is `tradingagents web --port 8765 --open`. CLI analysis
+is retained legacy code and is outside continued product maintenance. The Web
+workbench is loopback-only; it binds to `127.0.0.1`.
+
+## Change Routing
+
+| Change | Read and update as needed |
+| --- | --- |
+| Public Python request, result, artifact, or runtime contract | `tradingagents/execution/models.py`, `tradingagents/agents/schemas/`, `tradingagents/runtime/`, consumers and projections |
+| Graph roles, routing, or evidence sequence | `tradingagents/graph/`, `tradingagents/agents/`, `ARCHITECTURE.md` |
+| Vendor capability or A-share source behavior | `tradingagents/dataflows/`, `docs/operations/a-share-data-capabilities.md` |
+| Research methodology skills or role mapping | `tradingagents/skills/registry.py` (code-owned) and `tradingagents/skills/library/`; keep threshold heuristics labeled advisory |
+| Web API, SSE, persistence, or Reader/Audit projection | `tradingagents/web/`, `frontend/src/api/contracts.ts`, relevant frontend consumers |
+| React/TypeScript source | `frontend/AGENTS.md`; rebuild generated assets |
+| Runtime, configuration, CLI, or workflow behavior | Indexed operations/contracts docs and `ARCHITECTURE.md`; update both READMEs when the product overview changes |
+
+Code schemas and validation are authoritative for machine contracts. Markdown
+documents intent, ownership, compatibility, and navigation; do not duplicate
+large schema definitions in prose.
+
+## Local Boundaries
+
+- Put credentials only in ignored local configuration such as `.env`,
+  `.env.enterprise`, and `tradingagents.local.json`. Never commit values,
+  copies, logs, fixtures, or documentation examples containing secrets.
+- Default user data is outside this checkout under `~/.tradingagents/`.
+  Treat caches, reports, run records, checkpoints, and local presets as user
+  data; do not delete or rewrite them during routine development.
+- `frontend/src/` is source. After changing it, run
+  `npm --prefix frontend run build` and include the resulting tracked changes
+  under `tradingagents/web/static/` in the same change.
+
+## Finish Checklist
+
+- When the user authorizes Git publication (commit/push or PR creation), default
+  to branch → PR → merge after applicable local checks and required GitHub checks
+  and reviews pass. No separate merge confirmation is needed. Stop for material
+  scope uncertainty, conflicts, failed/pending checks or missing required review;
+  never bypass protections. Preserve unrelated work and user data.
+
+- Scope changes to the owning layer; retain existing uncommitted work.
+- Start contract changes from their canonical Python or TypeScript schema and
+  update every affected adapter, projection, and consumer.
+- Run `python scripts/check_agent_docs.py` and the applicable Ruff, frontend
+  install/typecheck/build checks; run pytest, Vitest, or Playwright for the
+  affected layer using the tracked tests.
+- Rebuild `tradingagents/web/static/` after frontend source changes.
+- Update the current-state documentation surface when behavior, configuration,
+  contract ownership, or operational workflow changed.
+- Inspect `git diff --check` and `git status --short`; do not remove unrelated
+  changes, local data, or generated assets belonging to another change.

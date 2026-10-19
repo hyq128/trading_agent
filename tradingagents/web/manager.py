@@ -1,0 +1,1777 @@
+"""Single-writer lifecycle owner for localhost analysis workers."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import threading
+from collections import deque
+from collections.abc import Callable, Mapping
+from copy import deepcopy
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime
+from math import isfinite
+from typing import Any, Protocol
+
+from tradingagents.agents.schemas import ResearchCaseV2
+from tradingagents.dataflows.config import config_scope
+from tradingagents.dataflows.interface import news_cache_scope
+from tradingagents.dataflows.progress import DataProgressEvent, progress_sink
+from tradingagents.dataflows.symbol_utils import normalize_symbol
+from tradingagents.dataflows.ticker_utils import normalize_ticker_symbol
+from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.execution.config_identity import prepare_effective_config
+from tradingagents.execution.models import (
+    AnalysisCancelled,
+    AnalysisRequest,
+    AnalysisResult,
+    CancellationToken,
+    HoldingContext,
+    holding_context_from_dict,
+)
+from tradingagents.observability.events import PersistedEvent, RunEventDraft
+from tradingagents.observability.graph_tasks import GraphObservationRunContext
+from tradingagents.observability.observer import DurableRunObserver
+from tradingagents.observability.projections import RoleProjectionRunContext
+from tradingagents.observability.provenance import provenance_scope
+from tradingagents.observability.roles import role_instance_id, roles_for_profile
+from tradingagents.runtime.contracts import (
+    PRODUCTION_RUNTIME_CONTRACT,
+    RuntimeContractSelection,
+    RuntimePolicyVersion,
+)
+
+from .batch_models import BatchItem, BatchSnapshot
+from .broker import EventBroker
+from .degradations import summarize_data_degradations
+from .projections import RunProjectionPublisher
+from .reports import ReportArtifactWriter, ReportPublicationError
+from .run_models import RunSnapshot, utc_timestamp
+from .scheduler import RunScheduler
+from .store import RunStore
+
+TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+RETRYABLE_RUN_STATUSES = TERMINAL_RUN_STATUSES | {"interrupted"}
+ORPHANED_RUN_STATUSES = frozenset({"running", "cancel_requested"})
+QUEUEABLE_RUN_STATUSES = frozenset({"created", "queued"})
+
+
+class ManagedRunner(Protocol):
+    def run(
+        self,
+        request: AnalysisRequest,
+        *,
+        cancellation_token: CancellationToken,
+        observation_context: GraphObservationRunContext,
+        callbacks: list[Any],
+        checkpoint_run_id: str,
+        checkpoint_guard: Any,
+    ) -> AnalysisResult: ...
+
+
+RunnerFactory = Callable[[AnalysisRequest, DurableRunObserver], ManagedRunner]
+CheckpointGuardFactory = Callable[
+    [RunStore, str, AnalysisRequest, Mapping[str, Any]],
+    Any,
+]
+RequestResolver = Callable[[RunSnapshot], AnalysisRequest]
+ResumePreflight = Callable[[RunSnapshot, AnalysisRequest], Any]
+StartupReconciler = Callable[[RunSnapshot, DurableRunObserver], None]
+
+
+class RunManagerError(RuntimeError):
+    pass
+
+
+class RunNotActive(RunManagerError):
+    pass
+
+
+class RunNotRetryable(RunManagerError):
+    pass
+
+
+class ResumeRunConflict(RunManagerError):
+    def __init__(self, message: str, *, fields: tuple[str, ...] = ()):
+        self.fields = fields
+        super().__init__(message)
+
+
+class RunNotResumable(ResumeRunConflict):
+    pass
+
+
+class LegacyResumeNormalizationFailed(RunNotResumable):
+    """A stored pre-P1 snapshot cannot truthfully become a holding review."""
+
+    pass
+
+
+class SingleRunManager:
+    """Own exactly one background analysis and every durable lifecycle edge."""
+
+    def __init__(
+        self,
+        store: RunStore,
+        broker: EventBroker | None = None,
+        runner_factory: RunnerFactory | None = None,
+        *,
+        report_writer: ReportArtifactWriter | None = None,
+        checkpoint_guard_factory: CheckpointGuardFactory | None = None,
+        startup_reconciler: StartupReconciler | None = None,
+        request_resolver: RequestResolver | None = None,
+        resume_preflight: ResumePreflight | None = None,
+        chatgpt_auth=None,
+    ) -> None:
+        self.store = store
+        self.broker = broker or EventBroker(store)
+        self._uses_default_runner_factory = runner_factory is None
+        self.chatgpt_auth = chatgpt_auth
+        self.runner_factory = runner_factory or self._runner_factory
+        self.report_writer = report_writer or ReportArtifactWriter(store)
+        self.checkpoint_guard_factory = (
+            checkpoint_guard_factory or _default_checkpoint_guard_factory
+        )
+        self.startup_reconciler = startup_reconciler
+        self.request_resolver = request_resolver
+        self.resume_preflight = resume_preflight
+        self._guard = threading.RLock()
+        self.scheduler = RunScheduler(
+            store=store,
+            lock=self._guard,
+            resolve_request=self._request_for_snapshot,
+            thread_target=self._worker,
+            on_admitted=self._on_run_admitted,
+            on_launch_failure=self._finish_failure,
+        )
+        self._requests: dict[str, AnalysisRequest] = {}
+
+    def _runner_factory(self, request, observer):
+        return _default_runner_factory(request, observer, chatgpt_auth=self.chatgpt_auth)
+
+    @property
+    def active_run_id(self) -> str | None:
+        return self.scheduler.active_run_id
+
+    @property
+    def active_run_ids(self) -> tuple[str, ...]:
+        return self.scheduler.active_run_ids
+
+    @property
+    def max_concurrency(self) -> int:
+        return self.scheduler.max_concurrency
+
+    def set_concurrency(self, value: int) -> int:
+        return self.scheduler.set_concurrency(value)
+
+    @property
+    def _pending(self) -> deque[str]:
+        """Compatibility handle for the frozen manager test suite, which
+        drives the FIFO through this attribute; production code must go
+        through ``self.scheduler`` instead."""
+        return self.scheduler.pending
+
+    def start(
+        self,
+        request: AnalysisRequest,
+        *,
+        configured_keys: Mapping[str, bool] | None = None,
+        batch_id: str | None = None,
+        batch_ordinal: int | None = None,
+        batch_item: BatchItem | None = None,
+    ) -> RunSnapshot:
+        normalized = _complete_request(request)
+        with self._guard:
+            snapshot = self._create_run(
+                normalized,
+                configured_keys=configured_keys,
+                batch_id=batch_id,
+                batch_ordinal=batch_ordinal,
+                batch_item=batch_item,
+                queued=self.scheduler.queued_by_occupancy(),
+            )
+            self.scheduler.queue_run(snapshot.run_id)
+            self.scheduler.drain()
+            return self.store.read_snapshot(snapshot.run_id)
+
+    def start_batch(
+        self,
+        requests: tuple[tuple[AnalysisRequest, BatchItem], ...],
+        *,
+        configured_keys: Mapping[str, bool] | None = None,
+        concurrency: int = 3,
+    ) -> BatchSnapshot:
+        if not 1 <= len(requests) <= 8:
+            raise ValueError("batch must contain between 1 and 8 requests")
+        self.set_concurrency(concurrency)
+        with self._guard:
+            batch_items: list[BatchItem] = []
+            for ordinal, (_request, item) in enumerate(requests):
+                batch_items.append(
+                    item if item.ordinal == ordinal else replace(item, ordinal=ordinal)
+                )
+            batch = BatchSnapshot.create(items=tuple(batch_items), concurrency=concurrency)
+            self.store.create_batch(batch)
+            for (request, _original_item), item in zip(requests, batch.items, strict=True):
+                snapshot = self._create_run(
+                    _complete_request(request),
+                    configured_keys=configured_keys,
+                    batch_id=batch.batch_id,
+                    batch_ordinal=item.ordinal,
+                    batch_item=item,
+                    run_id=item.run_id,
+                    queued=self.scheduler.queued_by_capacity(),
+                )
+                self.scheduler.queue_run(snapshot.run_id)
+            self.scheduler.drain()
+            return self.store.read_batch(batch.batch_id)
+
+    def cancel(self, run_id: str) -> RunSnapshot:
+        with self._guard:
+            active = self.scheduler.active_entry(run_id)
+            if active is not None:
+                if active.phase != "running":
+                    raise RunNotActive(f"run is already terminalizing: {run_id}")
+                snapshot = self.store.read_snapshot(run_id)
+                if snapshot.status == "cancel_requested":
+                    return snapshot
+                self.broker.publish(
+                    RunEventDraft(
+                        run_id,
+                        "run.cancel_requested",
+                        {
+                            "run_status": "cancel_requested",
+                            "summary": "Cancellation requested by the local user.",
+                        },
+                        status="cancel_requested",
+                    )
+                )
+                active.token.cancel()
+                return self.store.read_snapshot(run_id)
+
+            snapshot = self.store.read_snapshot(run_id)
+            if snapshot.status not in {"created", "queued"}:
+                raise RunNotActive(f"run cannot be cancelled from {snapshot.status}")
+            self.scheduler.discard_queued(run_id)
+            summary = "Analysis cancelled before execution started."
+            self.broker.publish(
+                RunEventDraft(
+                    run_id,
+                    "run.cancelled",
+                    {"run_status": "cancelled", "summary": summary},
+                    status="cancelled",
+                )
+            )
+            self.scheduler.sync_batch_for_run(run_id)
+            self.scheduler.drain()
+            return self.store.read_snapshot(run_id)
+
+    def cancel_batch(self, batch_id: str) -> BatchSnapshot:
+        with self._guard:
+            batch = self.store.read_batch(batch_id)
+            for item in batch.items:
+                snapshot = self.store.read_snapshot(item.run_id)
+                if snapshot.status in {"created", "queued", "running"}:
+                    self.cancel(item.run_id)
+            return self.store.read_batch(batch_id)
+
+    def batch(self, batch_id: str) -> BatchSnapshot:
+        return self.store.read_batch(batch_id)
+
+    def list_batches(self) -> tuple[BatchSnapshot, ...]:
+        return tuple(self.store.list_batches())
+
+    def retry(self, run_id: str) -> RunSnapshot:
+        source = self.store.read_snapshot(run_id)
+        if source.status not in RETRYABLE_RUN_STATUSES:
+            raise RunNotRetryable(
+                f"run cannot be retried from status {source.status}: {run_id}"
+            )
+        request = self._request_for_snapshot(source)
+        with self._guard:
+            snapshot = self._create_run(
+                request,
+                configured_keys=source.configured_keys,
+                retry_of=source.run_id,
+            )
+            self.scheduler.queue_run(snapshot.run_id)
+            self.scheduler.drain()
+            return self.store.read_snapshot(snapshot.run_id)
+
+    def resume(self, run_id: str) -> RunSnapshot:
+        snapshot = self.store.read_snapshot(run_id)
+        if snapshot.status != "interrupted":
+            raise RunNotResumable(
+                f"run cannot be resumed from status {snapshot.status}: {run_id}"
+            )
+        request = self._request_for_snapshot(snapshot)
+        with self._guard:
+            checkpoint_guard = self._validate_resume(snapshot, request)
+            resumed_from = snapshot.latest_sequence
+            checkpoint_sequence = _checkpoint_sequence(
+                self.store.read_events(run_id)
+            )
+            self.store.write_snapshot_atomic(
+                snapshot.evolve(resumed_from_sequence=resumed_from)
+            )
+            self.broker.publish(
+                RunEventDraft(
+                    run_id,
+                    "run.resumed",
+                    {
+                        "run_status": "running",
+                        "checkpoint_sequence": checkpoint_sequence,
+                        "resumed_from_sequence": resumed_from,
+                    },
+                    status="running",
+                )
+            )
+            self.scheduler.queue_run(
+                run_id,
+                resume=True,
+                checkpoint_guard=checkpoint_guard,
+                resumed_from=resumed_from,
+            )
+            self.scheduler.drain()
+            return self.store.read_snapshot(run_id)
+
+    def recover_startup(self) -> tuple[RunSnapshot, ...]:
+        recovered: list[RunSnapshot] = []
+        with self._guard:
+            self._assert_idle()
+            for summary in self.store.list_runs():
+                if summary.status not in ORPHANED_RUN_STATUSES:
+                    continue
+                snapshot = self.store.read_snapshot(summary.run_id)
+                request = self._request_for_snapshot(snapshot)
+                observer = DurableRunObserver(
+                    self.store,
+                    snapshot.run_id,
+                    event_sink=self.broker.publish,
+                    development_assertions=False,
+                )
+                reconciliation_error: BaseException | None = None
+                try:
+                    self._reconcile_startup(snapshot, request, observer)
+                except Exception as exc:
+                    reconciliation_error = exc
+                reason = (
+                    "startup_reconciliation_failed"
+                    if reconciliation_error is not None
+                    else "server_restarted"
+                )
+                self._terminalize_open_lifecycles(
+                    snapshot.run_id,
+                    mode="interrupted",
+                    reason=reason,
+                )
+                events = self.store.read_events(snapshot.run_id)
+                current = self.store.read_snapshot(snapshot.run_id)
+                self.store.write_snapshot_atomic(
+                    current.evolve(
+                        summary="The local server stopped before this analysis finished.",
+                        error_category=(
+                            _error_category(reconciliation_error)
+                            if reconciliation_error is not None
+                            else None
+                        ),
+                    )
+                )
+                self.broker.publish(
+                    RunEventDraft(
+                        snapshot.run_id,
+                        "run.interrupted",
+                        {
+                            "run_status": "interrupted",
+                            "checkpoint_sequence": _checkpoint_sequence(events),
+                            "summary": "The local server stopped before this analysis finished.",
+                            **(
+                                {
+                                    "error_category": _error_category(
+                                        reconciliation_error
+                                    )
+                                }
+                                if reconciliation_error is not None
+                                else {}
+                            ),
+                        },
+                        status="interrupted",
+                    )
+                )
+                recovered.append(self.store.read_snapshot(snapshot.run_id))
+            for summary in self.store.list_runs():
+                if summary.status in {"created", "queued"}:
+                    self._requests.setdefault(
+                        summary.run_id,
+                        self._request_for_snapshot(self.store.read_snapshot(summary.run_id)),
+                    )
+                    if not self.scheduler.is_queued(summary.run_id):
+                        self.scheduler.queue_run(summary.run_id)
+            for batch in self.store.list_batches():
+                for item in batch.items:
+                    self.scheduler.sync_batch_for_run(item.run_id)
+            self.scheduler.drain()
+        return tuple(recovered)
+
+    def wait(self, run_id: str, timeout: float | None = None) -> RunSnapshot:
+        active = self.scheduler.active_entry(run_id)
+        if active is not None:
+            active.thread.join(timeout)
+        return self.store.read_snapshot(run_id)
+
+    def _assert_idle(self) -> None:
+        """Compatibility no-op: the scheduler accepts multiple queued runs."""
+        return
+
+    def _create_run(
+        self,
+        request: AnalysisRequest,
+        *,
+        configured_keys: Mapping[str, bool] | None,
+        retry_of: str | None = None,
+        batch_id: str | None = None,
+        batch_ordinal: int | None = None,
+        batch_item: BatchItem | None = None,
+        run_id: str | None = None,
+        queued: bool = True,
+    ) -> RunSnapshot:
+        config = dict(request.effective_config)
+        from tradingagents.execution.native_runner import WORKFLOW_VERSION
+        safe_config = prepare_effective_config(config)
+        snapshot = RunSnapshot.create(
+            ticker=request.ticker,
+            analysis_date=request.analysis_date,
+            asset_type=request.asset_type,
+            selected_analysts=request.selected_analysts,
+            max_debate_rounds=request.max_debate_rounds,
+            max_risk_discuss_rounds=request.max_risk_discuss_rounds,
+            output_language=str(config.get("output_language") or "English"),
+            llm_provider=str(config.get("llm_provider") or ""),
+            quick_think_llm=str(config.get("quick_think_llm") or ""),
+            deep_think_llm=str(config.get("deep_think_llm") or ""),
+            configured_keys=dict(configured_keys or {}),
+            mode=request.mode,
+            horizon=request.horizon,
+            holding_context=(
+                asdict(request.holding_context)
+                if request.holding_context is not None
+                else None
+            ),
+            run_id=run_id,
+            retry_of=retry_of,
+            metadata={
+                "effective_config": safe_config,
+                **(
+                    {
+                        **request.profile_identity(),
+                        "catalyst_policy": request.catalyst_policy.model_dump(mode="json"),
+                    }
+                    if request.research_profile == "catalyst_v1"
+                    else {}
+                ),
+                **({**request.profile_identity(),
+                    "native_workflow_version": WORKFLOW_VERSION,
+                    "evidence_policy": request.evidence_policy.model_dump(mode="json")}
+                    if request.research_profile == "evidence_v1" else {}),
+                **(
+                    {
+                        "batch_id": batch_id,
+                        "batch_ordinal": batch_ordinal,
+                        "batch_input": batch_item.input_value,
+                        "company_name": batch_item.company_name,
+                        "market": batch_item.market,
+                    }
+                    if batch_id is not None and batch_item is not None
+                    else {}
+                ),
+            },
+        )
+        self.store.create_run(snapshot)
+        if queued:
+            self.broker.publish(
+                RunEventDraft(
+                    snapshot.run_id,
+                    "run.queued",
+                    {
+                        "run_status": "queued",
+                        "summary": "Analysis is queued for execution.",
+                        "ticker": snapshot.ticker,
+                        "batch_id": batch_id,
+                    },
+                    status="queued",
+                )
+            )
+        else:
+            self._publish_run_started(snapshot.run_id, request)
+        self._initialize_roles(snapshot.run_id, request.selected_analysts)
+        self._requests[snapshot.run_id] = request
+        return self.store.read_snapshot(snapshot.run_id)
+
+    def _initialize_roles(
+        self,
+        run_id: str,
+        selected_analysts: tuple[str, ...],
+    ) -> None:
+        selected = set(selected_analysts)
+        for role in self._roles_for_run(run_id):
+            included = role.analyst_key is None or role.analyst_key in selected
+            status = "pending" if included else "skipped"
+            reason = "selected" if included else "not_selected"
+            self.broker.publish(
+                RunEventDraft(
+                    run_id,
+                    "role.status_changed",
+                    {
+                        "role_instance_id": role_instance_id(run_id, role.actor_id),
+                        "previous_status": "uninitialized",
+                        "new_status": status,
+                        "reason": reason,
+                    },
+                    team_id=role.team_id,
+                    actor_id=role.actor_id,
+                    node_id=role.node_id,
+                    status=status,
+                )
+            )
+
+    def _on_run_admitted(self, run_id: str, request: AnalysisRequest) -> None:
+        """Scheduler hook: publish the started edge and sync the manifest."""
+        snapshot = self.store.read_snapshot(run_id)
+        if snapshot.status in {"created", "queued"}:
+            self._publish_run_started(run_id, request)
+        self.scheduler.sync_batch_for_run(run_id)
+
+    def _publish_run_started(self, run_id: str, request: AnalysisRequest) -> None:
+        snapshot = self.store.read_snapshot(run_id)
+        self.broker.publish(
+            RunEventDraft(
+                run_id,
+                "run.started",
+                {
+                    "run_status": "running",
+                    "ticker": snapshot.ticker,
+                    "asset_type": snapshot.asset_type,
+                    "analysis_date": snapshot.analysis_date,
+                    "selected_analysts": list(snapshot.selected_analysts),
+                    "research_depth": snapshot.max_debate_rounds,
+                    "mode": request.mode,
+                    "horizon": request.horizon,
+                    "holding_summary": _holding_summary(request.holding_context),
+                    "max_debate_rounds": snapshot.max_debate_rounds,
+                    "max_risk_discuss_rounds": snapshot.max_risk_discuss_rounds,
+                    "output_language": snapshot.output_language,
+                    "llm_provider": snapshot.llm_provider,
+                    "quick_think_llm": snapshot.quick_think_llm,
+                    "deep_think_llm": snapshot.deep_think_llm,
+                    "checkpoint_enabled": bool(request.effective_config.get("checkpoint_enabled")),
+                    **({"research_profile": request.research_profile} if request.research_profile in {"catalyst_v1", "evidence_v1"} else {}),
+                    **({"native_workflow_version": snapshot.metadata.get("native_workflow_version"),
+                        "focus_requested": bool(request.research_question)} if request.research_profile == "evidence_v1" else {}),
+                },
+                status="running",
+            )
+        )
+
+    def _drain_locked(self) -> None:
+        """Frozen-test alias for :meth:`RunScheduler.drain`."""
+        self.scheduler.drain()
+
+    def _sync_batch_for_run(self, run_id: str) -> None:
+        """Frozen-test alias for :meth:`RunScheduler.sync_batch_for_run`."""
+        self.scheduler.sync_batch_for_run(run_id)
+
+    def _worker(
+        self,
+        run_id: str,
+        request: AnalysisRequest,
+        token: CancellationToken,
+        resume: bool,
+        checkpoint_guard_override: Any | None,
+        resumed_from_sequence: int | None,
+    ) -> None:
+        observer = DurableRunObserver(
+            self.store,
+            run_id,
+            event_sink=self.broker.publish,
+            development_assertions=False,
+        )
+        try:
+            with config_scope(request.effective_config), progress_sink(
+                self._progress_sink(observer)
+            ), news_cache_scope(run_id), provenance_scope(observer):
+                config_artifact = observer.store_artifact(
+                    "data",
+                    prepare_effective_config(request.effective_config),
+                )
+                self._record_config_artifact(run_id, config_artifact.artifact_id)
+                if resume:
+                    if resumed_from_sequence is None:
+                        raise RunNotResumable("resume sequence is missing")
+                    self._resume_open_turns(observer, resumed_from_sequence)
+                runner = self.runner_factory(request, observer)
+                run_context = GraphObservationRunContext(
+                    observer,
+                    RoleProjectionRunContext(
+                        request.effective_config,
+                        effective_config_artifact_id=config_artifact.artifact_id,
+                    ),
+                    runtime_contract=getattr(
+                        runner,
+                        "runtime_contract",
+                        PRODUCTION_RUNTIME_CONTRACT,
+                    ),
+                )
+                checkpoint_guard = checkpoint_guard_override
+                if checkpoint_guard is None:
+                    checkpoint_guard = self.checkpoint_guard_factory(
+                        self.store,
+                        run_id,
+                        request,
+                        request.effective_config,
+                    )
+                catalyst_kwargs = {}
+                if request.research_profile in {"catalyst_v1", "evidence_v1"}:
+                    catalyst_kwargs["publication_authorizer"] = lambda journal: self._authorize_catalyst(run_id, token, journal)
+                result = runner.run(
+                    request,
+                    cancellation_token=token,
+                    observation_context=run_context,
+                    callbacks=[observer],
+                    checkpoint_run_id=run_id,
+                    checkpoint_guard=checkpoint_guard,
+                    **catalyst_kwargs,
+                )
+                status = self._begin_terminalization(run_id)
+                if status == "cancel_requested":
+                    self._finish_cancelled(run_id)
+                else:
+                    self._finish_success(run_id, request, result)
+        except AnalysisCancelled:
+            self._begin_terminalization(run_id)
+            self._finish_cancelled(run_id)
+        except BaseException as exc:
+            self._begin_terminalization(run_id)
+            if self.store.read_snapshot(run_id).status not in TERMINAL_RUN_STATUSES:
+                self._finish_failure(run_id, exc)
+        finally:
+            self.scheduler.release(run_id)
+
+    def _begin_terminalization(self, run_id: str) -> str:
+        self.scheduler.mark_terminalizing(run_id)
+        return self.store.read_snapshot(run_id).status
+
+    def _authorize_catalyst(self, run_id, token, journal) -> None:
+        with self._guard:
+            token.raise_if_cancelled()
+            if self.store.read_snapshot(run_id).status == "cancel_requested":
+                raise AnalysisCancelled()
+            # Durable authorization is the linearization point shared with cancel().
+            journal.put("publication_authorized", True)
+            self.scheduler.mark_terminalizing(run_id)
+
+    def _roles_for_run(self, run_id):
+        metadata = self.store.read_snapshot(run_id).metadata
+        return roles_for_profile(metadata.get("research_profile", "classic"),
+                                 workflow_version=metadata.get("native_workflow_version"),
+                                 focus_requested=bool(metadata.get("research_question")))
+
+    def _finish_success(
+        self,
+        run_id: str,
+        request: AnalysisRequest,
+        result: AnalysisResult,
+    ) -> None:
+        # Learning/holding-review runs leave skipped roles pending. Only those
+        # roles are expected on success; a running role still indicates an
+        # incomplete lifecycle and must fail the invariant below.
+        self._terminalize_pending_roles(run_id, reason="analysis_completed")
+        invalid_roles = {
+            actor_id: status
+            for actor_id, (status, _event) in _reduce_open_lifecycles(
+                self.store.read_events(run_id)
+            ).roles.items()
+            if status in {"pending", "running", "interrupted"}
+        }
+        if invalid_roles:
+            raise RunManagerError(
+                "successful analysis left non-terminal aggregate roles"
+            )
+        publication = self.report_writer.publish_final(
+            run_id,
+            dict(result.final_state),
+            request.ticker,
+        )
+        complete_artifacts = [
+            artifact
+            for artifact in publication.artifacts
+            if artifact.locator == "reports/complete_report.md"
+        ]
+        if len(complete_artifacts) != 1:
+            raise ReportPublicationError(
+                "canonical publication must contain exactly one complete report artifact"
+            )
+        degraded_data_sources = summarize_data_degradations(
+            self.store.read_events(run_id)
+        )
+        completed_at = utc_timestamp()
+        terminal_timestamp = datetime.fromisoformat(
+            completed_at.replace("Z", "+00:00")
+        )
+        artifact_ids: list[str] = []
+        for artifact in publication.artifacts:
+            artifact_ids.append(artifact.artifact_id)
+            self.broker.publish(
+                RunEventDraft(
+                    run_id,
+                    "artifact.written",
+                    {
+                        "artifact_id": artifact.artifact_id,
+                        "kind": artifact.kind,
+                        "media_type": artifact.media_type,
+                        "content_sha256": artifact.content_sha256,
+                        "byte_size": artifact.byte_size,
+                        "locator": artifact.locator,
+                    },
+                )
+            )
+        current = self.store.read_snapshot(run_id)
+        completion_summary = "Analysis completed successfully."
+        if request.research_profile == "evidence_v1":
+            assessment = result.final_state["native_research_record"]["assessment"]
+            completion_summary = (
+                "研究流程已完成；判断受证据限制。"
+                if assessment["completeness"] != "complete" or assessment["quality"] == "LOW_CONFIDENCE"
+                else "研究流程已完成。"
+            )
+        self.store.write_snapshot_atomic(
+            current.evolve(
+                final_signal=result.final_signal,
+                summary=completion_summary,
+                error_category=None,
+                artifacts=tuple(dict.fromkeys((*current.artifacts, *artifact_ids))),
+            )
+        )
+        self.broker.publish(
+            RunEventDraft(
+                run_id,
+                "run.completed",
+                {
+                    "run_status": "completed",
+                    "summary": completion_summary,
+                    "final_signal": result.final_signal,
+                    "report_artifact_ids": artifact_ids,
+                    "final_report_artifact_id": complete_artifacts[0].artifact_id,
+                    "completed_at": completed_at,
+                    "degraded_data_sources": degraded_data_sources,
+                },
+                status="completed",
+                timestamp=terminal_timestamp,
+            )
+        )
+        with contextlib.suppress(Exception):
+            # A derived cache must never change an already-committed run outcome.
+            RunProjectionPublisher(self.store).publish_view(run_id)
+        with contextlib.suppress(Exception):
+            # Cross-run thesis diff is a best-effort derived reading aid. It must
+            # read only committed artifacts and must never change the run's
+            # completed terminal state.
+            self._publish_thesis_diff(run_id, completed_at)
+        if request.research_profile in {"catalyst_v1", "evidence_v1"}:
+            return
+        try:
+            from .debate_summary import schedule_debate_summary
+
+            schedule_debate_summary(self.store, run_id)
+        except Exception:
+            # Summary generation is a best-effort reading aid; never terminal.
+            pass
+
+    def _publish_thesis_diff(self, run_id: str, completed_at: str) -> str | None:
+        """Build and persist the cross-run thesis diff after run completion.
+
+        Best effort: it reads only the committed research-case-v2 artifact and
+        previously completed runs. The caller suppresses failures so publication
+        can never alter the already-committed terminal run state.
+        """
+        from tradingagents.research.thesis_diff import (
+            THESIS_DIFF_CONTRACT,
+            build_thesis_diff_for_run,
+        )
+
+        events = self.store.read_events(run_id)
+        case_artifact_id = None
+        case_sequence = -1
+        completed_event = None
+        for event in events:
+            if (
+                event.type == "run.completed"
+                and event.payload.get("completed_at") == completed_at
+            ):
+                completed_event = event
+                continue
+            if event.type != "artifact.written":
+                continue
+            payload = event.payload
+            if payload.get("public_contract") != "research-case-v2":
+                continue
+            sequence = payload.get("committed_sequence")
+            artifact_id = payload.get("artifact_id")
+            if (
+                isinstance(sequence, int)
+                and isinstance(artifact_id, str)
+                and sequence > case_sequence
+            ):
+                case_sequence, case_artifact_id = sequence, artifact_id
+        if not case_artifact_id or completed_event is None:
+            return None
+
+        def existing_publication_id(current_events: list[PersistedEvent]) -> str | None:
+            for event in current_events:
+                if (
+                    event.type == "artifact.written"
+                    and event.payload.get("public_contract") == THESIS_DIFF_CONTRACT
+                    and event.payload.get("source_artifact_id") == case_artifact_id
+                    and event.payload.get("source_event_id")
+                    == completed_event.event_id
+                ):
+                    artifact_id = event.payload.get("artifact_id")
+                    if isinstance(artifact_id, str):
+                        return artifact_id
+            return None
+
+        existing = existing_publication_id(events)
+        if existing is not None:
+            return existing
+
+        raw = self.store.read_artifact(run_id, case_artifact_id)
+        current_case = ResearchCaseV2.model_validate(json.loads(raw))
+        diff = build_thesis_diff_for_run(
+            self.store,
+            run_id=run_id,
+            current_case=current_case,
+            current_case_artifact_id=case_artifact_id,
+            current_completed_at=completed_at,
+        )
+        with self.store.lock_for(run_id):
+            existing = existing_publication_id(self.store.read_events(run_id))
+            if existing is not None:
+                return existing
+            artifact = self.store.store_artifact(
+                run_id,
+                kind=THESIS_DIFF_CONTRACT,
+                value=diff.model_dump(mode="json"),
+            )
+            self.broker.publish(
+                RunEventDraft(
+                    run_id,
+                    "artifact.written",
+                    {
+                        "artifact_id": artifact.artifact_id,
+                        "kind": artifact.kind,
+                        "media_type": artifact.media_type,
+                        "content_sha256": artifact.content_sha256,
+                        "byte_size": artifact.byte_size,
+                        "locator": artifact.locator,
+                        "public_contract": THESIS_DIFF_CONTRACT,
+                        "committed_sequence": case_sequence,
+                        "source_artifact_id": case_artifact_id,
+                        "source_event_id": completed_event.event_id,
+                        "publication_phase": "post_completion",
+                    },
+                    parent_event_id=completed_event.event_id,
+                    status="committed",
+                )
+            )
+            return artifact.artifact_id
+
+    def _finish_cancelled(self, run_id: str) -> None:
+        snapshot = self.store.read_snapshot(run_id)
+        if snapshot.status == "running":
+            self.broker.publish(
+                RunEventDraft(
+                    run_id,
+                    "run.cancel_requested",
+                    {
+                        "run_status": "cancel_requested",
+                        "summary": "Cancellation reached a safe execution boundary.",
+                    },
+                    status="cancel_requested",
+                )
+            )
+        self._terminalize_open_lifecycles(
+            run_id,
+            mode="cancelled",
+            reason="user_cancelled",
+        )
+        summary = "Analysis cancelled by the local user."
+        current = self.store.read_snapshot(run_id)
+        self.store.write_snapshot_atomic(current.evolve(summary=summary))
+        self.broker.publish(
+            RunEventDraft(
+                run_id,
+                "run.cancelled",
+                {"run_status": "cancelled", "summary": summary},
+                status="cancelled",
+            )
+        )
+
+    def _finish_failure(self, run_id: str, error: BaseException) -> None:
+        self._terminalize_open_lifecycles(
+            run_id,
+            mode="failed",
+            reason="analysis_failed",
+        )
+        category = _error_category(error)
+        error_message = f"{type(error).__name__}: {error}"
+        error_traceback = _format_traceback(error)
+        summary = f"Analysis failed in the {category.replace('_', ' ')} stage."
+        current = self.store.read_snapshot(run_id)
+        self.store.write_snapshot_atomic(
+            current.evolve(
+                summary=summary,
+                error_category=category,
+                error_message=error_message,
+                error_traceback=error_traceback,
+            )
+        )
+        self.broker.publish(
+            RunEventDraft(
+                run_id,
+                "run.failed",
+                {
+                    "run_status": "failed",
+                    "summary": summary,
+                    "error_category": category,
+                    "error_message": error_message,
+                },
+                status="failed",
+            )
+        )
+
+    def _terminalize_open_lifecycles(
+        self,
+        run_id: str,
+        *,
+        mode: str,
+        reason: str,
+    ) -> None:
+        reduced = _reduce_open_lifecycles(self.store.read_events(run_id))
+        model_terminal = "model.failed" if mode == "failed" else "model.interrupted"
+        for event in reduced.models.values():
+            payload = {
+                **event.payload,
+                "duration_ms": 0,
+                "usage": {},
+                "reason": reason,
+            }
+            self.broker.publish(_terminal_draft(event, model_terminal, payload, mode))
+
+        data_terminal = "data.failed" if mode == "failed" else "data.interrupted"
+        for event in reduced.data_calls.values():
+            payload = {
+                **event.payload,
+                "stage": "failed" if mode == "failed" else "interrupted",
+                "data_status": "failed" if mode == "failed" else "interrupted",
+                "duration_ms": 0,
+                "reason": reason,
+            }
+            self.broker.publish(_terminal_draft(event, data_terminal, payload, mode))
+
+        execution_terminal = (
+            "tool.execution_failed"
+            if mode == "failed"
+            else "tool.execution_interrupted"
+        )
+        for event in reduced.tool_executions.values():
+            payload = {**event.payload, "duration_ms": 0, "reason": reason}
+            self.broker.publish(
+                _terminal_draft(event, execution_terminal, payload, mode)
+            )
+
+        if mode != "interrupted":
+            for event in reduced.logical_tools.values():
+                self.broker.publish(
+                    _terminal_draft(
+                        event,
+                        "tool.cancelled",
+                        {**event.payload, "reason": reason},
+                        "cancelled",
+                    )
+                )
+
+        turn_status = mode
+        for event in reduced.turns.values():
+            self.broker.publish(
+                _terminal_draft(
+                    event,
+                    f"turn.{turn_status}",
+                    {
+                        **event.payload,
+                        "turn_status": turn_status,
+                        "duration_ms": 0,
+                        "reason": reason,
+                    },
+                    turn_status,
+                )
+            )
+
+        for actor_id, (status, event) in reduced.roles.items():
+            if status != "running":
+                continue
+            role = next(role for role in self._roles_for_run(run_id) if role.actor_id == actor_id)
+            self.broker.publish(
+                RunEventDraft(
+                    run_id,
+                    "role.status_changed",
+                    {
+                        "role_instance_id": role_instance_id(run_id, actor_id),
+                        "previous_status": "running",
+                        "new_status": mode,
+                        "reason": reason,
+                        **(
+                            {"turn_id": event.payload.get("turn_id")}
+                            if event.payload.get("turn_id")
+                            else {}
+                        ),
+                    },
+                    team_id=role.team_id,
+                    actor_id=actor_id,
+                    node_id=role.node_id,
+                    status=mode,
+                    parent_event_id=event.event_id,
+                )
+            )
+        if mode != "interrupted":
+            self._terminalize_pending_roles(run_id, reason=reason)
+
+    def _terminalize_pending_roles(self, run_id: str, *, reason: str) -> None:
+        reduced = _reduce_open_lifecycles(self.store.read_events(run_id))
+        for actor_id, (status, event) in reduced.roles.items():
+            if status != "pending":
+                continue
+            role = next(role for role in self._roles_for_run(run_id) if role.actor_id == actor_id)
+            self.broker.publish(
+                RunEventDraft(
+                    run_id,
+                    "role.status_changed",
+                    {
+                        "role_instance_id": role_instance_id(run_id, actor_id),
+                        "previous_status": "pending",
+                        "new_status": "not_reached",
+                        "reason": reason,
+                    },
+                    team_id=role.team_id,
+                    actor_id=actor_id,
+                    node_id=role.node_id,
+                    status="not_reached",
+                    parent_event_id=event.event_id,
+                )
+            )
+
+    def _record_config_artifact(self, run_id: str, artifact_id: str) -> None:
+        with self.store.lock_for(run_id):
+            current = self.store.read_snapshot(run_id)
+            metadata = dict(current.metadata)
+            metadata["effective_config_artifact_id"] = artifact_id
+            self.store.write_snapshot_atomic(
+                current.evolve(
+                    metadata=metadata,
+                    artifacts=tuple(
+                        dict.fromkeys((*current.artifacts, artifact_id))
+                    ),
+                )
+            )
+
+    def _progress_sink(
+        self,
+        observer: DurableRunObserver,
+    ) -> Callable[[DataProgressEvent], None]:
+        def emit(event: DataProgressEvent) -> None:
+            if (
+                event.run_id == observer.run_id
+                and event.turn_id
+                and event.graph_task_id
+                and event.vendor_call_id
+            ):
+                observer.emit(
+                    RunEventDraft(
+                        observer.run_id,
+                        "data.progress",
+                        {
+                            "turn_id": event.turn_id,
+                            "graph_task_id": event.graph_task_id,
+                            "tool_call_id": event.tool_call_id,
+                            "vendor_call_id": event.vendor_call_id,
+                            "method": event.method,
+                            "vendor": event.vendor,
+                            "stage": event.stage,
+                            "data_status": "progress",
+                            "message": event.message,
+                            "artifact_id": event.artifact_id,
+                        },
+                        status="progress",
+                    )
+                )
+
+        return emit
+
+    def _resume_open_turns(
+        self,
+        observer: DurableRunObserver,
+        resumed_from_sequence: int,
+    ) -> None:
+        reduced = _reduce_open_lifecycles(
+            self.store.read_events(observer.run_id)
+        )
+        for turn_id in reduced.interrupted_turns:
+            observer.resume_turn(turn_id, resumed_from_sequence)
+
+    def _request_for_snapshot(self, snapshot: RunSnapshot) -> AnalysisRequest:
+        request = self._requests.get(snapshot.run_id)
+        if request is not None:
+            return request
+        if self.request_resolver is not None:
+            return _complete_request(self.request_resolver(snapshot))
+        resolved = _request_from_snapshot(snapshot)
+        return _complete_request(resolved) if self._uses_default_runner_factory else resolved
+
+    def _validate_resume(
+        self,
+        snapshot: RunSnapshot,
+        request: AnalysisRequest,
+    ) -> Any | None:
+        if self.resume_preflight is not None:
+            return self.resume_preflight(snapshot, request)
+        if self._uses_default_runner_factory:
+            return _default_resume_preflight(
+                self.store,
+                snapshot,
+                request,
+                self.runner_factory,
+                self.checkpoint_guard_factory,
+            )
+        return None
+
+    def _reconcile_startup(
+        self,
+        snapshot: RunSnapshot,
+        request: AnalysisRequest,
+        observer: DurableRunObserver,
+    ) -> None:
+        if self.startup_reconciler is not None:
+            self.startup_reconciler(snapshot, observer)
+            return
+        _default_startup_reconciler(snapshot, request, observer)
+
+
+@dataclass(frozen=True)
+class _OpenLifecycles:
+    models: dict[str, PersistedEvent]
+    tool_executions: dict[str, PersistedEvent]
+    data_calls: dict[str, PersistedEvent]
+    logical_tools: dict[str, PersistedEvent]
+    turns: dict[str, PersistedEvent]
+    interrupted_turns: dict[str, PersistedEvent]
+    roles: dict[str, tuple[str, PersistedEvent]]
+
+
+def _reduce_open_lifecycles(events: list[PersistedEvent]) -> _OpenLifecycles:
+    models: dict[str, PersistedEvent] = {}
+    executions: dict[str, PersistedEvent] = {}
+    data_calls: dict[str, PersistedEvent] = {}
+    logical_tools: dict[str, PersistedEvent] = {}
+    turns: dict[str, PersistedEvent] = {}
+    interrupted_turns: dict[str, PersistedEvent] = {}
+    roles: dict[str, tuple[str, PersistedEvent]] = {}
+    for event in events:
+        payload = event.payload
+        if event.type == "model.started":
+            models[str(payload["model_call_id"])] = event
+        elif event.type in {"model.completed", "model.failed", "model.interrupted"}:
+            models.pop(str(payload["model_call_id"]), None)
+        elif event.type == "tool.execution_started":
+            executions[str(payload["tool_execution_id"])] = event
+        elif event.type in {
+            "tool.execution_completed",
+            "tool.execution_failed",
+            "tool.execution_interrupted",
+        }:
+            executions.pop(str(payload["tool_execution_id"]), None)
+        elif event.type == "data.progress":
+            data_calls[str(payload["vendor_call_id"])] = event
+        elif event.type in {"data.completed", "data.failed", "data.interrupted"}:
+            data_calls.pop(str(payload["vendor_call_id"]), None)
+        elif event.type == "tool.requested":
+            logical_tools[str(payload["tool_call_id"])] = event
+        elif event.type in {"tool.committed", "tool.cancelled"}:
+            logical_tools.pop(str(payload["tool_call_id"]), None)
+        elif event.type in {"turn.started", "turn.resumed", "turn.output_ready"}:
+            turn_id = str(payload["turn_id"])
+            turns[turn_id] = event
+            interrupted_turns.pop(turn_id, None)
+        elif event.type == "turn.interrupted":
+            turn_id = str(payload["turn_id"])
+            turns.pop(turn_id, None)
+            interrupted_turns[turn_id] = event
+        elif event.type in {"turn.completed", "turn.failed", "turn.cancelled"}:
+            turn_id = str(payload["turn_id"])
+            turns.pop(turn_id, None)
+            interrupted_turns.pop(turn_id, None)
+        if event.type == "role.status_changed" and event.actor_id:
+            roles[event.actor_id] = (str(payload["new_status"]), event)
+    return _OpenLifecycles(
+        models,
+        executions,
+        data_calls,
+        logical_tools,
+        turns,
+        interrupted_turns,
+        roles,
+    )
+
+
+def _terminal_draft(
+    source: PersistedEvent,
+    event_type: str,
+    payload: dict[str, Any],
+    status: str,
+) -> RunEventDraft:
+    return RunEventDraft(
+        source.run_id,
+        event_type,
+        payload,
+        team_id=source.team_id,
+        actor_id=source.actor_id,
+        node_id=source.node_id,
+        status=status,
+        parent_event_id=source.event_id,
+    )
+
+
+def _complete_request(request: AnalysisRequest) -> AnalysisRequest:
+    config = deepcopy(DEFAULT_CONFIG)
+    for key, value in request.effective_config.items():
+        if isinstance(value, Mapping) and isinstance(config.get(key), dict):
+            config[key].update(deepcopy(dict(value)))
+        else:
+            config[key] = deepcopy(value)
+    config["max_debate_rounds"] = request.max_debate_rounds
+    config["max_risk_discuss_rounds"] = request.max_risk_discuss_rounds
+    return replace(request, effective_config=config)
+
+
+def _request_from_snapshot(snapshot: RunSnapshot) -> AnalysisRequest:
+    config: dict[str, Any] = {}
+    stored = snapshot.metadata.get("effective_config")
+    if isinstance(stored, Mapping):
+        for key, value in stored.items():
+            if key == "backend_url" and isinstance(value, Mapping):
+                config[key] = _endpoint_from_identity(value)
+            elif isinstance(value, Mapping) and isinstance(config.get(key), dict):
+                config[key].update(deepcopy(dict(value)))
+            else:
+                config[key] = deepcopy(value)
+    config.update(
+        {
+            "llm_provider": snapshot.llm_provider,
+            "quick_think_llm": snapshot.quick_think_llm,
+            "deep_think_llm": snapshot.deep_think_llm,
+            "max_debate_rounds": snapshot.max_debate_rounds,
+            "max_risk_discuss_rounds": snapshot.max_risk_discuss_rounds,
+            "output_language": snapshot.output_language,
+        }
+    )
+    holding_context = _holding_context_from_snapshot(snapshot)
+    mode = snapshot.mode
+    if mode is None:
+        mode = "holding_review" if holding_context is not None else "company_research"
+    if mode == "holding_review" and holding_context is None:
+        raise LegacyResumeNormalizationFailed(
+            "holding review snapshot has no normalized holding context"
+        )
+    if mode == "company_research" and holding_context is not None:
+        raise LegacyResumeNormalizationFailed(
+            "company research snapshot unexpectedly includes holding context"
+        )
+    from tradingagents.research.catalyst_evidence_policy import CatalystEvidencePolicyV1
+    from tradingagents.research.native_evidence_policy import NativeEvidencePolicyV1
+
+    profile = snapshot.metadata.get("research_profile", "classic")
+    if profile == "evidence_v1" and "evidence_policy" not in snapshot.metadata:
+        raise LegacyResumeNormalizationFailed("native snapshot has no evidence policy identity")
+    policy_payload = snapshot.metadata.get("catalyst_policy")
+    return AnalysisRequest(
+        ticker=snapshot.ticker,
+        analysis_date=snapshot.analysis_date,
+        asset_type=snapshot.asset_type,
+        selected_analysts=snapshot.selected_analysts,
+        max_debate_rounds=snapshot.max_debate_rounds,
+        max_risk_discuss_rounds=snapshot.max_risk_discuss_rounds,
+        horizon=snapshot.horizon or "medium",
+        mode=mode,
+        holding_context=holding_context,
+        effective_config=config,
+        research_profile=profile,
+        research_question=snapshot.metadata.get("research_question"),
+        catalyst_policy=(
+            CatalystEvidencePolicyV1.model_validate(policy_payload)
+            if profile == "catalyst_v1" and policy_payload is not None
+            else None
+        ),
+        evidence_policy=(NativeEvidencePolicyV1.model_validate(snapshot.metadata["evidence_policy"])
+            if profile == "evidence_v1" and "evidence_policy" in snapshot.metadata else None),
+    )
+
+
+def _holding_context_from_snapshot(snapshot: RunSnapshot) -> HoldingContext | None:
+    if snapshot.holding_context is not None:
+        try:
+            return holding_context_from_dict(snapshot.holding_context)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LegacyResumeNormalizationFailed(
+                "stored holding context cannot be normalized"
+            ) from exc
+    portfolio_payload = snapshot.metadata.get("portfolio")
+    if portfolio_payload is None:
+        return None
+    if not isinstance(portfolio_payload, Mapping):
+        raise LegacyResumeNormalizationFailed("stored legacy portfolio has invalid shape")
+    return _legacy_portfolio_holding_context(
+        portfolio_payload,
+        snapshot.ticker,
+        snapshot.analysis_date,
+    )
+
+
+def _legacy_portfolio_holding_context(
+    portfolio: Mapping[str, Any],
+    ticker: str,
+    analysis_date: str,
+) -> HoldingContext:
+    positions = portfolio.get("positions")
+    if not isinstance(positions, (list, tuple)):
+        raise LegacyResumeNormalizationFailed("stored legacy portfolio has invalid positions")
+    canonical_ticker = normalize_symbol(normalize_ticker_symbol(ticker))
+    matches = [
+        position
+        for position in positions
+        if isinstance(position, Mapping)
+        and normalize_symbol(normalize_ticker_symbol(str(position.get("ticker", ""))))
+        == canonical_ticker
+    ]
+    if len(matches) != 1:
+        raise LegacyResumeNormalizationFailed("stored legacy target position is unavailable")
+    target = matches[0]
+    quantity = _finite_float(target.get("quantity"))
+    average_cost = _finite_float(target.get("average_cost"))
+    if quantity is None or quantity <= 0 or average_cost is None or average_cost <= 0:
+        raise LegacyResumeNormalizationFailed("stored legacy target position is invalid")
+    cash = _finite_float(portfolio.get("cash"))
+    if cash is None or cash < 0:
+        raise LegacyResumeNormalizationFailed("stored legacy portfolio cash is invalid")
+    currency = portfolio.get("currency")
+    if not isinstance(currency, str) or len(currency) != 3 or not currency.isalpha():
+        raise LegacyResumeNormalizationFailed("stored legacy portfolio currency is invalid")
+    return HoldingContext(
+        ticker=canonical_ticker,
+        quantity=quantity,
+        average_cost=average_cost,
+        cash=cash,
+        total_account_value=None,
+        currency=currency.upper(),
+        facts_as_of=analysis_date,
+        original_thesis=None,
+        source="legacy_portfolio",
+    )
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if isfinite(normalized) else None
+
+
+def _holding_summary(context: HoldingContext | None) -> dict[str, Any] | None:
+    if context is None:
+        return None
+    return {
+        "ticker": context.ticker,
+        "quantity": context.quantity,
+        "average_cost": context.average_cost,
+        "currency": context.currency,
+        "facts_as_of": context.facts_as_of,
+        "source": context.source,
+        "has_cash": context.cash is not None,
+        "has_total_account_value": context.total_account_value is not None,
+        "has_original_thesis": context.original_thesis is not None,
+    }
+
+
+def _endpoint_from_identity(value: Mapping[str, Any]) -> str | None:
+    scheme = value.get("scheme")
+    host = value.get("host")
+    if not isinstance(scheme, str) or not isinstance(host, str) or not scheme or not host:
+        return None
+    port = value.get("port")
+    path = value.get("path") if isinstance(value.get("path"), str) else "/"
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    authority = host if port in {None, default_port} else f"{host}:{port}"
+    return f"{scheme}://{authority}{path or '/'}"
+
+
+def _default_runner_factory(
+    request: AnalysisRequest,
+    observer: DurableRunObserver,
+    *, chatgpt_auth=None,
+) -> ManagedRunner:
+    if request.research_profile == "evidence_v1":
+        from tradingagents.execution.native_runner import NativeRunner
+        return NativeRunner(observer, chatgpt_auth=chatgpt_auth) if request.effective_config.get("llm_provider") == "chatgpt" else NativeRunner(observer)
+    if request.research_profile == "catalyst_v1":
+        from tradingagents.execution.catalyst_runner import CatalystRunner
+        return CatalystRunner(observer)
+    from tradingagents.execution.runner import AnalysisRunner
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    owner = TradingAgentsGraph(
+        selected_analysts=request.selected_analysts,
+        config=dict(request.effective_config),
+        callbacks=[observer],
+        observation_enabled=True,
+    )
+    return AnalysisRunner(owner)
+
+
+def _default_checkpoint_guard_factory(
+    store: RunStore,
+    run_id: str,
+    request: AnalysisRequest,
+    effective_config: Mapping[str, Any],
+) -> Any:
+    if request.research_profile in {"catalyst_v1", "evidence_v1"}:
+        return None
+    from .fingerprint import FingerprintCheckpointGuard
+
+    return FingerprintCheckpointGuard(
+        store,
+        run_id,
+        request,
+        effective_config,
+    )
+
+
+def _default_resume_preflight(
+    store: RunStore,
+    snapshot: RunSnapshot,
+    request: AnalysisRequest,
+    runner_factory: RunnerFactory,
+    guard_factory: CheckpointGuardFactory,
+) -> Any:
+    if request.research_profile == "evidence_v1":
+        from tradingagents.execution.native_runner import NativeResumeGuard, validate_native_resume
+        try:
+            validate_native_resume(store, snapshot.run_id, request)
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            raise RunNotResumable("native checkpoint missing, corrupt or incompatible") from exc
+        return NativeResumeGuard()
+    if request.research_profile == "catalyst_v1":
+        from tradingagents.execution.catalyst_runner import (
+            CatalystResumeGuard,
+            validate_catalyst_resume,
+        )
+        try:
+            validate_catalyst_resume(store, snapshot.run_id, request)
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            raise RunNotResumable("catalyst checkpoint missing, corrupt or incompatible") from exc
+        return CatalystResumeGuard()
+    from tradingagents.execution.runner import AnalysisRunner, checkpoint_access
+
+    from .fingerprint import CheckpointIncompatible
+    from .reconciliation import (
+        CheckpointObservationIncompatible,
+        reconcile_checkpoint_frontier,
+    )
+
+    observer = DurableRunObserver(
+        store,
+        snapshot.run_id,
+        development_assertions=False,
+    )
+    with config_scope(request.effective_config):
+        runner = runner_factory(request, observer)
+        if not isinstance(runner, AnalysisRunner):
+            raise RunNotResumable("the configured runner cannot prove resume compatibility")
+        owner = runner.owner
+        if not owner.config.get("checkpoint_enabled"):
+            raise RunNotResumable("checkpoint resume is disabled")
+        owner.ticker = request.ticker
+        initial_context = runner.prepare_initial_context(request)
+        access = checkpoint_access(
+            owner.config["data_cache_dir"],
+            request.ticker,
+            request.analysis_date,
+            owner._run_signature(request.asset_type, request.horizon),
+            run_id=snapshot.run_id,
+        )
+        guard = guard_factory(
+            store,
+            snapshot.run_id,
+            request,
+            request.effective_config,
+        )
+        try:
+            preauthorize = getattr(guard, "preauthorize", None)
+            authorization = (
+                preauthorize(initial_context, access)
+                if callable(preauthorize)
+                else guard(initial_context, access)
+            )
+        except CheckpointIncompatible as exc:
+            raise ResumeRunConflict(
+                "checkpoint_incompatible",
+                fields=exc.mismatch_categories,
+            ) from exc
+        if authorization.mode != "resume":
+            raise RunNotResumable("no durable checkpoint exists for this run")
+        assert access.latest is not None
+        try:
+            plan = reconcile_checkpoint_frontier(
+                store.read_events(snapshot.run_id),
+                access.latest,
+                access.parent,
+                read_artifact=lambda artifact_id: store.read_artifact(
+                    snapshot.run_id,
+                    artifact_id,
+                ),
+                policy_version=runner.runtime_contract.policy_version,
+            )
+        except CheckpointObservationIncompatible as exc:
+            raise ResumeRunConflict(
+                "checkpoint_observation_incompatible",
+                fields=exc.categories,
+            ) from exc
+        if plan.missing_checkpoint_transition is not None or plan.abandoned_task_ids:
+            raise ResumeRunConflict(
+                "checkpoint_observation_not_reconciled",
+                fields=("observation_frontier",),
+            )
+        return guard
+
+
+def _default_startup_reconciler(
+    snapshot: RunSnapshot,
+    request: AnalysisRequest,
+    observer: DurableRunObserver,
+) -> None:
+    if request.research_profile == "evidence_v1":
+        from tradingagents.execution.native_runner import validate_native_resume
+        validate_native_resume(observer.store, snapshot.run_id, request)
+        return
+    if request.research_profile == "catalyst_v1":
+        from tradingagents.runtime.catalyst_checkpoint import load_checkpoint
+        load_checkpoint(observer.store, snapshot.run_id)
+        return
+    from tradingagents.execution.runner import AnalysisRunner, checkpoint_access
+
+    from .reconciliation import apply_reconciliation_plan, reconcile_checkpoint_frontier
+
+    config = request.effective_config
+    if not config.get("checkpoint_enabled"):
+        _abandon_uncommitted_event_tail(observer, cancel_all_tools=True)
+        return
+    signature = "|".join(
+        (
+            "analysts=" + ",".join(request.selected_analysts),
+            f"debate={request.max_debate_rounds}",
+            f"risk={request.max_risk_discuss_rounds}",
+            f"asset={request.asset_type}",
+        )
+    )
+    access = checkpoint_access(
+        config["data_cache_dir"],
+        request.ticker,
+        request.analysis_date,
+        signature,
+        run_id=snapshot.run_id,
+    )
+    if access.latest is None:
+        _abandon_uncommitted_event_tail(observer, cancel_all_tools=True)
+        return
+    plan = reconcile_checkpoint_frontier(
+        observer.store.read_events(snapshot.run_id),
+        access.latest,
+        access.parent,
+        read_artifact=lambda artifact_id: observer.store.read_artifact(
+            snapshot.run_id,
+            artifact_id,
+        ),
+        policy_version=_runtime_policy_from_snapshot(snapshot),
+    )
+
+    def current_checkpoint_id() -> str | None:
+        current = checkpoint_access(
+            config["data_cache_dir"],
+            request.ticker,
+            request.analysis_date,
+            signature,
+            run_id=snapshot.run_id,
+        ).latest
+        if current is None:
+            return None
+        configurable = current.config.get("configurable", {})
+        return configurable.get("checkpoint_id") or current.checkpoint.get("id")
+
+    apply_reconciliation_plan(
+        observer.store,
+        snapshot.run_id,
+        plan,
+        current_checkpoint_id=current_checkpoint_id,
+        observer=observer,
+    )
+    AnalysisRunner.promote_reconciled_tasks(observer, plan)
+
+
+def _runtime_policy_from_snapshot(snapshot: RunSnapshot) -> RuntimePolicyVersion:
+    """Select the durable run policy; legacy snapshots are exactly v2."""
+
+    payload = snapshot.resume_fingerprint
+    if payload is None:
+        return PRODUCTION_RUNTIME_CONTRACT.policy_version
+    document = payload.get("document") if isinstance(payload, Mapping) else None
+    runtime = document.get("runtime_contract") if isinstance(document, Mapping) else None
+    if runtime is None:
+        return PRODUCTION_RUNTIME_CONTRACT.policy_version
+    if not isinstance(runtime, Mapping):
+        raise RunNotResumable("runtime contract fingerprint is invalid")
+    policy_version = runtime.get("policy_version")
+    if not isinstance(policy_version, str):
+        raise RunNotResumable("runtime contract fingerprint is invalid")
+    try:
+        return RuntimeContractSelection(policy_version=policy_version).policy_version
+    except ValueError as exc:
+        raise RunNotResumable("runtime contract fingerprint is invalid") from exc
+
+
+def _abandon_uncommitted_event_tail(
+    observer: DurableRunObserver,
+    *,
+    cancel_all_tools: bool,
+) -> None:
+    """Close event work that has no durable SQLite frontier to resume from."""
+    events = observer.store.read_events(observer.run_id)
+    committed = {
+        str(task_id)
+        for event in events
+        if event.type in {"graph.step_applied", "graph.checkpoint_committed"}
+        for task_id in event.payload.get("applied_task_ids", ())
+    }
+    abandoned = {
+        str(event.payload["graph_task_id"])
+        for event in events
+        if event.type == "graph.task_abandoned"
+    }
+    starts = {
+        str(event.payload["graph_task_id"]): event
+        for event in events
+        if event.type == "graph.task_started"
+    }
+    candidates = {
+        str(event.payload["observation_commit"]["graph_task_id"]): event
+        for event in events
+        if event.type == "graph.task_output_ready"
+        and isinstance(event.payload.get("observation_commit"), Mapping)
+    }
+    tails = sorted(
+        (set(starts) | set(candidates)) - committed - abandoned,
+        key=lambda task_id: (starts.get(task_id) or candidates[task_id]).sequence,
+    )
+    for task_id in tails:
+        source = starts.get(task_id) or candidates[task_id]
+        observer.emit(
+            RunEventDraft(
+                observer.run_id,
+                "graph.task_abandoned",
+                {
+                    "graph_task_id": task_id,
+                    "graph_step": source.payload["graph_step"],
+                    "node_id": source.payload["node_id"],
+                    "reason": "process_interrupted_without_checkpoint",
+                },
+                actor_id=source.actor_id,
+                node_id=source.node_id,
+                status="abandoned",
+                parent_event_id=source.event_id,
+            )
+        )
+
+    refreshed = observer.store.read_events(observer.run_id)
+    reduced = _reduce_open_lifecycles(refreshed)
+    tail_set = set(tails)
+    for event in reduced.logical_tools.values():
+        if cancel_all_tools or str(event.payload["graph_task_id"]) in tail_set:
+            observer.emit(
+                _terminal_draft(
+                    event,
+                    "tool.cancelled",
+                    {
+                        **event.payload,
+                        "reason": "process_interrupted_without_checkpoint",
+                    },
+                    "cancelled",
+                )
+            )
+
+
+def _checkpoint_sequence(events: list[PersistedEvent]) -> int:
+    return max(
+        (
+            event.sequence
+            for event in events
+            if event.type == "graph.checkpoint_committed"
+        ),
+        default=0,
+    )
+
+
+def _error_category(error: BaseException | None) -> str:
+    from tradingagents.execution.native_model import NativeModelReferenceInvalid
+
+    if error is None:
+        return "unexpected_internal_failure"
+    if isinstance(error, ReportPublicationError):
+        return "report_publication"
+    if isinstance(error, NativeModelReferenceInvalid):
+        return "evidence_rejection"
+    name = type(error).__name__.lower()
+    if "checkpoint" in name or "fingerprint" in name:
+        return "checkpoint_incompatibility"
+    if "auth" in name or "credential" in name:
+        return "provider_authentication"
+    if "timeout" in name:
+        return "provider_timeout"
+    if "rate" in name and "limit" in name:
+        return "vendor_rate_limit"
+    if "evidence" in name:
+        return "evidence_rejection"
+    if isinstance(error, (ValueError, KeyError)):
+        return "missing_configuration"
+    return "unexpected_internal_failure"
+
+
+def _format_traceback(error: BaseException, *, limit: int = 8000) -> str:
+    """Render a truncated traceback string for durable persistence.
+
+    The full traceback can be large (deep LangGraph chains); ``limit`` keeps
+    the persisted run.json bounded while preserving the failing frame and the
+    immediate caller stack.
+    """
+    import traceback
+
+    rendered = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    if len(rendered) > limit:
+        rendered = rendered[:limit] + "\n... [truncated]"
+    return rendered
